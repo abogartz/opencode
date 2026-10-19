@@ -1,41 +1,33 @@
-import { escapeHtml, renderBlockKindToHtml } from "./html"
-import { parseInlines, type InlineParseOptions, type ReferenceDef } from "./inline"
+import { BlockParser, BNode, splitTableRow } from "./blocks"
+import { unescapeString } from "./entities"
+import { applyTailHeal, computeTailHeal, type TailHeal } from "./heal"
+import { renderBlockKindToHtml } from "./html"
+import { parseInlines, type ReferenceDef, type RefMap } from "./inline"
 import type {
   BlockKind,
   BlockPatch,
   HeadingLevel,
   InlineNode,
+  ListItemNode,
   MarkdownBlock,
   StreamFrame,
   StreamOptions,
-  TableAlign,
 } from "./types"
 
-const DEF_LINE_RE = /^[ \t]{0,3}\[([^\]]+)\]:[ \t]*<?([^\s>]+)>?(?:[ \t]+["'(]([^"')]+)["')])?[ \t]*$/
-const DEF_OPEN_RE = /^[ \t]{0,3}\[([^\]]+)\]:[ \t]*$/
-const DEF_CONT_RE = /^[ \t]+<?([^\s>]+)>?(?:[ \t]+["'(]([^"')]+)["')])?[ \t]*$/
-
-const HEADING_LEVELS: readonly HeadingLevel[] = [1, 2, 3, 4, 5, 6]
-
 /**
- * If `streaming` is true and the last line holds only a bare block opener
- * (`-`, `*`, `+`, `##`, `12.`, `>`, ```` ``` ````, `$$`), hold that line back until its
- * first content character or newline arrives. Prevents 1-frame paragraph-to-heading/list pops.
+ * If the last line holds only a bare block opener (`-`, `*`, `+`, `##`, `12.`, `>`, ```` ``` ````, `$$`), hold that
+ * line back until its first content character or newline arrives. Prevents 1-frame paragraph-to-heading/list pops.
  */
 export function splitPendingMarker(text: string): { visible: string; held: string } {
   const lastNl = text.lastIndexOf("\n")
   const lineStart = lastNl + 1
   const tailLine = text.slice(lineStart)
-
   if (!tailLine || tailLine.length > 12) return { visible: text, held: "" }
 
   const trimmed = tailLine.trim()
-
   if (!trimmed) return { visible: text, held: "" }
 
   const first = trimmed.charCodeAt(0)
-
-  // `#`, `` ` ``, `~`, `-`, `*`, `_`, `$`
   if (
     first === 0x23 /* # */ ||
     first === 0x60 /* ` */ ||
@@ -43,23 +35,19 @@ export function splitPendingMarker(text: string): { visible: string; held: strin
     first === 0x2d /* - */ ||
     first === 0x2a /* * */ ||
     first === 0x5f /* _ */ ||
-    first === 0x24 /* $ */
+    first === 0x24 /* $ */ ||
+    first === 0x3d /* = */
   ) {
     let allSame = true
-
     for (let i = 1; i < trimmed.length; i++) {
       if (trimmed.charCodeAt(i) !== first) {
         allSame = false
         break
       }
     }
-
     if (allSame) {
       const maxHold = first === 0x23 ? 6 : first === 0x60 || first === 0x7e ? 3 : 2
-
-      if (trimmed.length <= maxHold) {
-        return { visible: text.slice(0, lineStart), held: tailLine }
-      }
+      if (trimmed.length <= maxHold) return { visible: text.slice(0, lineStart), held: tailLine }
     }
   }
 
@@ -67,305 +55,72 @@ export function splitPendingMarker(text: string): { visible: string; held: strin
     return { visible: text.slice(0, lineStart), held: tailLine }
   }
 
-  // Bare ordered list marker `1`, `12.`, `1)`
   let d = 0
   while (d < trimmed.length && trimmed.charCodeAt(d) >= 0x30 && trimmed.charCodeAt(d) <= 0x39) d++
-
   if (d > 0) {
     const rest = trimmed.slice(d)
-
-    if (rest === "" || rest === "." || rest === ")") {
-      return { visible: text.slice(0, lineStart), held: tailLine }
-    }
+    if (rest === "" || rest === "." || rest === ")") return { visible: text.slice(0, lineStart), held: tailLine }
   }
 
   return { visible: text, held: "" }
 }
 
-interface RawParsedBlock {
-  start: number
-  end: number
-  raw: string
-  kind: BlockKind
-  canSettle: boolean
-  selfSettled?: boolean
-  listIndentsAfter: number[]
-  unresolvedRefs?: string[]
-  usedRefs?: string[]
-  def?: { id: string; href: string; title?: string; raw: string }
+// A partial line that is only `-`/`=` (with optional surrounding spaces) would turn the paragraph above into a
+// setext heading for a frame, before it grows into a list item or thematic break. Always hold it.
+const RE_SETEXT_CANDIDATE = /^[ \t]*(?:-+|=+)[ \t]*$/
+
+interface Converted {
+  kind: BlockKind | null
+  used: Set<string>
+  unresolved: Set<string>
 }
 
-function isThematicBreak(trimmed: string): boolean {
-  if (trimmed.length < 3) return false
-  const first = trimmed.charCodeAt(0)
-
-  if (first !== 0x2d /* - */ && first !== 0x2a /* * */ && first !== 0x5f /* _ */) return false
-  let count = 0
-
-  for (let i = 0; i < trimmed.length; i++) {
-    const c = trimmed.charCodeAt(i)
-
-    if (c === first) count++
-    else if (c !== 0x20 && c !== 0x09) return false
-  }
-
-  return count >= 3
+interface ConvertContext {
+  refmap: RefMap
+  /** whether results for persistent (non-forked) closed nodes may be cached */
+  cacheable: boolean
+  /** true when converting a block in the active streaming tail */
+  inTail: boolean
+  /** true when converting the last tail unit and the input ends with a non-empty partial line (no trailing `\n`) */
+  partialLine: boolean
+  healTarget: BNode | null
+  heal: TailHeal | null
+  used: Set<string>
+  unresolved: Set<string>
 }
 
-function isTableSeparator(trimmed: string): boolean {
-  if (!trimmed.includes("|") || !trimmed.includes("-")) return false
-
-  for (let i = 0; i < trimmed.length; i++) {
-    const c = trimmed.charCodeAt(i)
-
-    if (c !== 0x7c /* | */ && c !== 0x2d /* - */ && c !== 0x3a /* : */ && c !== 0x20 && c !== 0x09) {
-      return false
-    }
-  }
-
-  return true
+interface SettledMeta {
+  docIndex: number
+  lastIndex: number
+  unresolved: Set<string>
 }
 
-function parseTableAlign(separator: string): TableAlign[] {
-  let body = separator.trim()
-  if (body.startsWith("|")) body = body.slice(1)
-  if (body.endsWith("|")) body = body.slice(0, -1)
-
-  return body.split("|").map((cell) => {
-    const c = cell.trim()
-    const left = c.startsWith(":")
-    const right = c.endsWith(":")
-
-    if (left && right) return "center"
-    if (right) return "right"
-    if (left) return "left"
-
-    return null
-  })
-}
-
-function splitTableCells(line: string): string[] {
-  let body = line.trim()
-  if (body.startsWith("|")) body = body.slice(1)
-  if (body.endsWith("|") && !body.endsWith("\\|")) body = body.slice(0, -1)
-  const cells: string[] = []
-  let start = 0
-  let inTicks = false
-
-  for (let i = 0; i < body.length; i++) {
-    const c = body.charCodeAt(i)
-
-    if (c === 0x5c /* \ */) {
-      i++
-      continue
-    }
-
-    if (c === 0x60 /* ` */) {
-      inTicks = !inTicks
-      continue
-    }
-
-    if (c === 0x7c /* | */ && !inTicks) {
-      cells.push(body.slice(start, i).trim())
-      start = i + 1
-    }
-  }
-
-  cells.push(body.slice(start).trim())
-
-  return cells
-}
-
-function matchListMarker(line: string): {
-  indent: number
-  ordered: boolean
-  marker: string
-  start?: number
-  content: string
-} | null {
-  let i = 0
-  let indent = 0
-
-  while (i < line.length) {
-    const c = line.charCodeAt(i)
-
-    if (c === 0x20) {
-      indent++
-      i++
-    } else if (c === 0x09) {
-      indent += 4
-      i++
-    } else {
-      break
-    }
-  }
-
-  if (i >= line.length) return null
-  const first = line.charCodeAt(i)
-
-  // Bullet `- `, `* `, `+ `, `• `
-  if (
-    (first === 0x2d || first === 0x2a || first === 0x2b || first === 0x2022) &&
-    i + 1 < line.length &&
-    (line.charCodeAt(i + 1) === 0x20 || line.charCodeAt(i + 1) === 0x09)
-  ) {
-    return {
-      indent,
-      ordered: false,
-      marker: line[i]!,
-      content: line.slice(i + 2),
-    }
-  }
-
-  // Ordered `1. ` or `1) `
-  if (first >= 0x30 && first <= 0x39) {
-    let d = i
-    while (d < line.length && line.charCodeAt(d) >= 0x30 && line.charCodeAt(d) <= 0x39) d++
-
-    if (
-      d - i <= 9 &&
-      d + 1 < line.length &&
-      (line.charCodeAt(d) === 0x2e /* . */ || line.charCodeAt(d) === 0x29) /* ) */ &&
-      (line.charCodeAt(d + 1) === 0x20 || line.charCodeAt(d + 1) === 0x09)
-    ) {
-      const marker = line.slice(i, d + 1)
-
-      return {
-        indent,
-        ordered: true,
-        marker,
-        start: Number.parseInt(line.slice(i, d), 10),
-        content: line.slice(d + 2),
-      }
-    }
-  }
-
-  return null
-}
-
-function matchFenceOpen(line: string): {
-  indent: number
-  fence: string
-  char: number
-  len: number
-  language?: string
-  meta?: string
-} | null {
-  let i = 0
-  let indent = 0
-
-  while (i < line.length) {
-    const c = line.charCodeAt(i)
-
-    if (c === 0x20) {
-      indent++
-      i++
-    } else if (c === 0x09) {
-      indent += 4
-      i++
-    } else {
-      break
-    }
-  }
-
-  if (i + 2 >= line.length) return null
-  const ch = line.charCodeAt(i)
-
-  if (ch !== 0x60 /* ` */ && ch !== 0x7e /* ~ */) return null
-  let run = 1
-  while (i + run < line.length && line.charCodeAt(i + run) === ch) run++
-
-  if (run < 3) return null
-  const info = line.slice(i + run).trim()
-
-  // CommonMark rule: backtick fence info string cannot contain backticks
-  if (ch === 0x60 && info.includes("`")) return null
-  const parts = info ? info.split(/\s+/) : []
-  const language = parts[0] || undefined
-  const meta = parts.length > 1 ? parts.slice(1).join(" ") : undefined
-  const result: {
-    indent: number
-    fence: string
-    char: number
-    len: number
-    language?: string
-    meta?: string
-  } = {
-    indent,
-    fence: line.slice(i, i + run),
-    char: ch,
-    len: run,
-  }
-
-  if (language) result.language = language
-  if (meta) result.meta = meta
-
-  return result
-}
-
-function isFenceClose(line: string, fenceChar: number, minLen: number): boolean {
-  let i = 0
-  while (i < line.length && (line.charCodeAt(i) === 0x20 || line.charCodeAt(i) === 0x09)) i++
-  let run = 0
-
-  while (i < line.length && line.charCodeAt(i) === fenceChar) {
-    run++
-    i++
-  }
-
-  if (run < minLen) return false
-
-  while (i < line.length) {
-    const c = line.charCodeAt(i)
-
-    if (c !== 0x20 && c !== 0x09 && c !== 0x0d) return false
-    i++
-  }
-
-  return true
-}
-
-function matchStandaloneImage(trimmed: string): { alt: string; src: string; title?: string } | null {
-  if (!trimmed.startsWith("![") || !trimmed.endsWith(")")) return null
-  const sep = trimmed.indexOf("](")
-
-  if (sep < 2) return null
-  const alt = trimmed.slice(2, sep)
-  const rawDest = trimmed.slice(sep + 2, -1).trim()
-
-  if (!rawDest || rawDest.includes(")")) return null
-  const spaceIdx = rawDest.search(/\s/)
-
-  if (spaceIdx < 0) return { alt, src: rawDest }
-  const src = rawDest.slice(0, spaceIdx)
-  const rest = rawDest.slice(spaceIdx).trim()
-  const title = rest.length >= 2 && (rest.startsWith('"') || rest.startsWith("'")) ? rest.slice(1, -1) : undefined
-  const result: { alt: string; src: string; title?: string } = { alt, src }
-
-  if (title) result.title = title
-
-  return result
-}
+type ResolvedStreamOptions = Required<StreamOptions>
 
 export class PatchmarkStream {
-  private readonly options: Required<StreamOptions>
-  private fullText = ""
+  private readonly options: ResolvedStreamOptions
+  private text = ""
+  private parser!: BlockParser
+  /** offset just past the last complete line */
+  private fed = 0
+  /** text after the last complete line */
+  private partial = ""
+  private lineStarts: number[] = []
+  /** complete lines, without and with their terminators */
+  private lines: string[] = []
+  private lineRaw: string[] = []
+  private tailRaw: { startLine: number; upTo: number; text: string } | null = null
+  private finished = false
   private blocks: MarkdownBlock[] = []
   private settledCount = 0
-  private settledOffset = 0
-  private settledListIndents: number[] = []
+  private settledNodes = 0
+  private settledMeta: SettledMeta[] = []
+  private waiting = new Map<string, Set<number>>()
+  private refsSeen = 0
   private nextId = 0
-  private readonly defs = new Map<string, ReferenceDef>()
-  private readonly refToBlockIds = new Map<string, Set<number>>()
-  private readonly blockIdToRefs = new Map<number, Set<string>>()
-  private readonly tableRowCache = new Map<string, InlineNode[][]>()
-  private activeTableState: {
-    blockStart: number
-    committedOffset: number
-    align: TableAlign[]
-    headers: InlineNode[][]
-    committedRows: InlineNode[][][]
-  } | null = null
+  private cache = new WeakMap<BNode, { version: number; result: Converted }>()
+  private itemCache = new WeakMap<BNode, { version: number; item: ListItemNode; used: Set<string>; unresolved: Set<string> }>()
+  private disallowMath = new Set<number>()
 
   constructor(options: StreamOptions = {}) {
     this.options = {
@@ -373,1104 +128,810 @@ export class PatchmarkStream {
       math: options.math ?? true,
       heal: options.heal ?? true,
       holdPendingMarkers: options.holdPendingMarkers ?? true,
-      flatListBlocks: options.flatListBlocks ?? true,
+      flatListBlocks: options.flatListBlocks ?? false,
       settleOnComplete: options.settleOnComplete ?? true,
+      groupHtmlBlocks: options.groupHtmlBlocks ?? false,
       renderHtml: options.renderHtml ?? false,
     }
+    this.resetState()
+  }
+
+  private resetState() {
+    this.text = ""
+    this.disallowMath = new Set()
+    this.parser = new BlockParser({ gfm: this.options.gfm, math: this.options.math }, this.disallowMath)
+    this.fed = 0
+    this.partial = ""
+    this.lineStarts = []
+    this.lines = []
+    this.lineRaw = []
+    this.tailRaw = null
+    this.finished = false
+    this.blocks = []
+    this.settledCount = 0
+    this.settledNodes = 0
+    this.settledMeta = []
+    this.waiting = new Map()
+    this.refsSeen = 0
+    this.cache = new WeakMap()
+    this.itemCache = new WeakMap()
   }
 
   /** Reset the stream to empty state */
   reset(): void {
-    this.fullText = ""
-    this.blocks = []
-    this.settledCount = 0
-    this.settledOffset = 0
-    this.settledListIndents = []
+    this.resetState()
     this.nextId = 0
-    this.defs.clear()
-    this.refToBlockIds.clear()
-    this.blockIdToRefs.clear()
-    this.tableRowCache.clear()
-    this.activeTableState = null
   }
 
-  /** Current full text */
-  getText(): string {
-    return this.fullText
-  }
-
-  /** Current blocks snapshot */
   getBlocks(): ReadonlyArray<MarkdownBlock> {
     return this.blocks
   }
 
-  /** Append a streaming delta chunk in O(|delta| + |tail|) time */
-  append(delta: string): StreamFrame {
-    if (!delta) {
-      return {
-        text: this.fullText,
-        settledOffset: this.settledOffset,
-        blocks: this.getBlocks(),
-        patches: [],
-        heldMarker: "",
-        charsScanned: 0,
-      }
-    }
-
-    this.fullText += delta
-
-    return this.reconcileTail(true, delta)
+  getText(): string {
+    return this.text
   }
 
-  /** Declarative update: handles prefix append in O(|delta| + |tail|), or resets on non-prefix replacement */
+  /** Append a streaming delta chunk */
+  append(delta: string): StreamFrame {
+    if (!delta) return this.emptyFrame()
+    if (this.finished) return this.update(this.text + delta, { streaming: true })
+    this.text += delta
+    this.partial += delta
+    return this.step(true)
+  }
+
+  /** Finalize the stream: flush held markers and settle every block */
+  finalize(): StreamFrame {
+    return this.update(this.text, { streaming: false })
+  }
+
+  /** Declarative update: prefix appends are incremental; anything else re-parses and patches the difference */
   update(text: string, opts: { streaming?: boolean } = {}): StreamFrame {
     const streaming = opts.streaming ?? true
-
-    if (text === this.fullText) {
-      if (!streaming) return this.finalize()
-
-      return {
-        text: this.fullText,
-        settledOffset: this.settledOffset,
-        blocks: this.getBlocks(),
-        patches: [],
-        heldMarker: "",
-        charsScanned: 0,
-      }
+    if (this.finished || !text.startsWith(this.text)) {
+      if (this.finished && text === this.text) return this.emptyFrame()
+      return this.rebuild(text, streaming)
     }
+    if (text === this.text && streaming && this.blocks.length > 0) return this.emptyFrame()
+    this.partial += text.slice(this.text.length)
+    this.text = text
+    return this.step(streaming)
+  }
 
-    if (this.fullText.length > 0 && text.startsWith(this.fullText)) {
-      const delta = text.slice(this.fullText.length)
-      this.fullText = text
-
-      return this.reconcileTail(streaming, delta)
-    }
-
-    // Non-prefix replacement or truncation: check how many settled blocks still match
-    let keepSettled = 0
-    let keepOffset = 0
-
-    while (keepSettled < this.settledCount) {
-      const b = this.blocks[keepSettled]!
-
-      if (text.length >= b.end && text.startsWith(b.raw, b.start)) {
-        keepOffset = b.end
-        keepSettled++
-      } else {
-        break
-      }
-    }
-
-    const patches: BlockPatch[] = []
-    const prevTotal = this.blocks.length
-
-    if (keepSettled < prevTotal) {
-      patches.push({ op: "truncate", keepCount: keepSettled })
-    }
-
-    this.blocks.length = keepSettled
-    this.settledCount = keepSettled
-    this.settledOffset = keepOffset
-    if (keepSettled === 0) this.settledListIndents = []
-    this.activeTableState = null
-    this.fullText = text
-
-    const frame = this.reconcileTail(streaming, "")
-
+  private emptyFrame(): StreamFrame {
     return {
-      ...frame,
-      patches: patches.length > 0 ? [...patches, ...frame.patches] : frame.patches,
+      text: this.text,
+      settledOffset: this.settledOffset(),
+      blocks: this.blocks,
+      patches: [],
+      heldMarker: "",
+      charsScanned: 0,
     }
   }
 
-  /** Finalize the stream: flush any held markers and transition the active tail block(s) to "settled" */
-  finalize(): StreamFrame {
-    return this.reconcileTail(false, "")
+  private settledOffset(): number {
+    if (this.settledCount === 0) return 0
+    return this.blocks[this.settledCount - 1]!.end
   }
 
-  private resolveDefsForBlock(id: number): string | undefined {
-    const refs = this.blockIdToRefs.get(id)
-
-    if (!refs || refs.size === 0) return undefined
-    const lines: string[] = []
-
-    for (const refId of refs) {
-      const def = this.defs.get(refId)
-      if (def?.raw) lines.push(def.raw.trimEnd())
+  private rebuild(text: string, streaming: boolean): StreamFrame {
+    const previous = this.blocks
+    this.resetState()
+    this.text = text
+    this.partial = text
+    const frame = this.step(streaming)
+    const next = this.blocks
+    let keep = 0
+    while (
+      keep < previous.length &&
+      keep < next.length &&
+      previous[keep]!.status === "settled" &&
+      next[keep]!.status === "settled" &&
+      previous[keep]!.raw === next[keep]!.raw &&
+      previous[keep]!.start === next[keep]!.start
+    ) {
+      next[keep] = { ...next[keep]!, id: previous[keep]!.id }
+      keep++
     }
-
-    return lines.length > 0 ? lines.join("\n") : undefined
-  }
-
-  private reconcileTail(streaming: boolean, delta: string): StreamFrame {
+    for (let i = keep; i < next.length; i++) next[i] = { ...next[i]!, id: this.nextId++ }
     const patches: BlockPatch[] = []
-    const tailCount = this.blocks.length - this.settledCount
+    if (keep < previous.length) patches.push({ op: "truncate", keepCount: keep })
+    for (let i = keep; i < next.length; i++) {
+      patches.push({ op: "append", block: next[i]! })
+      if (next[i]!.status === "settled") patches.push({ op: "finalize", id: next[i]!.id, index: i, block: next[i]! })
+    }
+    return { ...frame, blocks: next, patches }
+  }
 
-    const tail = tailCount === 1 ? this.blocks[this.settledCount] : undefined
-    const tailKind = tail?.kind
+  private step(streaming: boolean): StreamFrame {
+    const before = this.fed
+    this.feedCompleteLines(streaming)
+    let partial = this.partial
 
-    // Fast path: if the sole tail block is an open code fence (whose opening fence line is already complete) and the delta cannot close it
-    if (
-      streaming &&
-      delta.length > 0 &&
-      tail &&
-      tailKind?.type === "code" &&
-      !tailKind.complete &&
-      tail.raw.includes("\n") &&
-      (!tailKind.indented || !delta.includes("\n"))
-    ) {
-      const fence = tailKind.fence
-      const prevLastNl = tail.raw.lastIndexOf("\n")
-      const affectedTail = tail.raw.slice(prevLastNl + 1) + delta
-
-      if (!affectedTail.includes(fence)) {
-        const updatedKind: BlockKind = {
-          ...tailKind,
-          source: tailKind.source + delta,
-        }
-
-        const updatedHtml =
-          this.options.renderHtml && tail.html
-            ? `${tail.html.slice(0, -14)}${escapeHtml(delta)}</code></pre>\n`
-            : this.options.renderHtml
-              ? renderBlockKindToHtml(updatedKind)
-              : undefined
-
-        const updatedBlock: MarkdownBlock = {
-          id: tail.id,
-          start: tail.start,
-          end: this.fullText.length,
-          raw: tail.raw + delta,
-          status: "streaming",
-          kind: updatedKind,
-        }
-
-        if (updatedHtml !== undefined) updatedBlock.html = updatedHtml
-        this.blocks[this.settledCount] = updatedBlock
-        patches.push({
-          op: "replace",
-          id: updatedBlock.id,
-          index: this.settledCount,
-          block: updatedBlock,
-        })
-
-        return {
-          text: this.fullText,
-          settledOffset: this.settledOffset,
-          blocks: this.blocks,
-          patches,
-          heldMarker: "",
-          charsScanned: affectedTail.length,
-        }
+    if (!streaming) {
+      if (partial.length > 0) {
+        this.pushLine(partial.endsWith("\r") ? partial.slice(0, -1) : partial, partial)
+        this.parser.incorporateLine(this.lines[this.lines.length - 1]!)
+        this.partial = ""
+        partial = ""
       }
+      this.parser.finish()
+      while (this.parser.unclosedMathAt) this.reparse(true)
+      this.finished = true
+    } else if (this.parser.unclosedMathAt) {
+      this.reparse(false)
     }
 
-    // Fast path: if the sole tail block is an open GFM table and new text continues adding table rows
-    if (
-      streaming &&
-      delta.length > 0 &&
-      tailCount === 1 &&
-      this.blocks[this.settledCount]!.kind.type === "table" &&
-      this.activeTableState &&
-      this.activeTableState.blockStart === this.settledOffset
-    ) {
-      const state = this.activeTableState
-      const tailSlice = this.fullText.slice(state.committedOffset)
-      const lines = tailSlice.split("\n")
-      let validTableContinuation = true
+    const oldSettledCount = this.settledCount
+    const prevTail = this.blocks.slice(oldSettledCount)
+    const nextBlocks: MarkdownBlock[] = []
+    const newSettledMeta: SettledMeta[] = []
 
-      for (let l = 0; l < lines.length; l++) {
-        const lt = lines[l]!.replace(/\r$/, "").trim()
-        if (l === lines.length - 1 && lt.length === 0) continue
-
-        if (!lt || !lt.includes("|") || matchFenceOpen(lt) || lt.startsWith("#")) {
-          validTableContinuation = false
-          break
-        }
+    let held = ""
+    let visible = ""
+    let preFork: { fork: BlockParser; tip: BNode } | null = null
+    if (streaming) {
+      visible = partial
+      if (visible.endsWith("\r")) visible = visible.slice(0, -1)
+      if (visible && RE_SETEXT_CANDIDATE.test(visible)) {
+        held = visible
+        visible = ""
+      } else if (visible && this.options.holdPendingMarkers) {
+        const split = splitPendingMarker(visible)
+        held = split.held
+        visible = split.visible
       }
-
-      if (validTableContinuation) {
-        const unresolved: string[] = []
-        const used: string[] = []
-        let advanced = 0
-
-        for (let l = 0; l < lines.length - 1; l++) {
-          const rawLine = lines[l]!
-          const lt = rawLine.replace(/\r$/, "").trim()
-
-          const parsedRow = splitTableCells(lt).map((cell) =>
-            parseInlines(cell, this.inlineOpts(false, unresolved, used)),
-          )
-
-          state.committedRows.push(parsedRow)
-          advanced += rawLine.length + 1
-        }
-
-        state.committedOffset += advanced
-        const lastLine = lines[lines.length - 1]!.replace(/\r$/, "").trim()
-
-        const allRows = lastLine
-          ? [
-              ...state.committedRows,
-              splitTableCells(lastLine).map((cell) => parseInlines(cell, this.inlineOpts(true, unresolved, used))),
-            ]
-          : [...state.committedRows]
-
-        const tail = this.blocks[this.settledCount]!
-        const updatedKind: BlockKind = {
-          type: "table",
-          align: state.align,
-          headers: state.headers,
-          rows: allRows,
-        }
-
-        const updatedBlock: MarkdownBlock = {
-          id: tail.id,
-          start: tail.start,
-          end: this.fullText.length,
-          raw: this.fullText.slice(tail.start),
-          status: "streaming",
-          kind: updatedKind,
-        }
-
-        if (this.options.renderHtml) updatedBlock.html = renderBlockKindToHtml(updatedKind)
-        this.blocks[this.settledCount] = updatedBlock
-        patches.push({
-          op: "replace",
-          id: updatedBlock.id,
-          index: this.settledCount,
-          block: updatedBlock,
-        })
-
-        return {
-          text: this.fullText,
-          settledOffset: this.settledOffset,
-          blocks: this.blocks,
-          patches,
-          heldMarker: "",
-          charsScanned: tailSlice.length,
-        }
+    }
+    const ensureFork = () => {
+      if (!preFork) {
+        const fork = this.parser.fork()
+        if (visible) fork.incorporateLine(visible)
+        const tip = fork.tip
+        fork.finish()
+        preFork = { fork, tip }
       }
-
-      this.activeTableState = null
+      return preFork
     }
 
-    const rawTail = this.fullText.slice(this.settledOffset)
-    const { visible: activeSlice, held } =
-      streaming && this.options.holdPendingMarkers
-        ? splitPendingMarker(rawTail)
-        : { visible: rawTail, held: "" }
-
-    const rawBlocks = this.parseSlice(activeSlice, this.settledOffset, streaming)
-    const visibleBlocks: RawParsedBlock[] = []
-
-    for (let i = 0; i < rawBlocks.length; i++) {
-      const rb = rawBlocks[i]!
-
-      if (rb.def) {
-        if (!this.options.settleOnComplete && visibleBlocks.length > 0) {
-          const prevVis = visibleBlocks[visibleBlocks.length - 1]!
-          prevVis.end = rb.end
-          prevVis.raw = this.fullText.slice(prevVis.start, rb.end)
-          prevVis.canSettle = false
-          prevVis.selfSettled = false
-        }
-
-        continue
-      }
-
-      visibleBlocks.push(rb)
-    }
-
-    const prevTail = this.blocks.slice(this.settledCount)
-    this.blocks.length = this.settledCount
-
-    if (prevTail.length > visibleBlocks.length) {
-      patches.push({ op: "truncate", keepCount: this.settledCount + visibleBlocks.length })
-    }
-
-    for (let i = 0; i < visibleBlocks.length; i++) {
-      const rb = visibleBlocks[i]!
-      const isLast = i === visibleBlocks.length - 1
-      const shouldSettle =
-        !streaming || (this.options.settleOnComplete && rb.selfSettled === true) || (!isLast && rb.canSettle)
-      const status: "streaming" | "settled" = shouldSettle ? "settled" : "streaming"
-
-      const existingTail = i < prevTail.length ? prevTail[i] : undefined
-      const id = existingTail ? existingTail.id : this.nextId++
-      const blockIndex = this.blocks.length
-
-      const allRefs = [...(rb.unresolvedRefs ?? []), ...(rb.usedRefs ?? [])]
-
-      if (allRefs.length > 0) {
-        let blockSet = this.blockIdToRefs.get(id)
-
-        if (!blockSet) {
-          blockSet = new Set()
-          this.blockIdToRefs.set(id, blockSet)
-        }
-
-        for (const refId of allRefs) {
-          blockSet.add(refId)
-          let set = this.refToBlockIds.get(refId)
-
-          if (!set) {
-            set = new Set()
-            this.refToBlockIds.set(refId, set)
+    // 1. Newly settled top-level blocks (or groups of them)
+    const children = this.parser.doc.children
+    while (this.settledNodes < children.length) {
+      const first = this.settledNodes
+      const last = this.groupEnd(children, first)
+      if (last < 0) break
+      const node = children[first]!
+      const isLast = last === children.length - 1
+      const early =
+        this.options.settleOnComplete &&
+        first === last &&
+        node.open &&
+        isLast &&
+        streaming &&
+        (node.type === "heading" || node.type === "thematic_break")
+      let open = false
+      for (let k = first; k <= last; k++) if (children[k]!.open) open = true
+      if (open && !early) break
+      if (!this.options.settleOnComplete && streaming) {
+        let hasVisibleAfter = false
+        for (let m = last + 1; m < children.length; m++) {
+          if (!children[m]!.open && !children[m]!.defsOnly) {
+            hasVisibleAfter = true
+            break
           }
-
-          set.add(id)
+        }
+        if (!hasVisibleAfter) {
+          const lastChild = children[children.length - 1]
+          const openAfter = lastChild && lastChild.open && children.length - 1 > last ? lastChild : null
+          if (!openAfter && !visible) break
+          const mayBeDef =
+            (openAfter && openAfter.type === "paragraph" && openAfter.content.charCodeAt(0) === 0x5b) ||
+            (!openAfter && /^[ \t]{0,3}\[/.test(visible))
+          if (mayBeDef) {
+            const { fork } = ensureFork()
+            if (!fork.doc.children.some((n) => !n.defsOnly)) break
+          }
         }
       }
-
-      const resolvedDefs = this.resolveDefsForBlock(id)
-      const block: MarkdownBlock = {
-        id,
-        start: rb.start,
-        end: rb.end,
-        raw: rb.raw,
-        status,
-        kind: rb.kind,
+      const ctx: ConvertContext = {
+        refmap: this.parser.refmap,
+        cacheable: true,
+        inTail: false,
+        partialLine: false,
+        healTarget: null,
+        heal: null,
+        used: new Set(),
+        unresolved: new Set(),
       }
+      const kind = this.convertUnit(children, first, last, ctx)
+      if (kind) {
+        const end = children[last]!
+        const rawEndLine = !this.options.settleOnComplete
+          ? last + 1 < children.length
+            ? children[last + 1]!.startLine - 1
+            : this.lines.length
+          : end.open
+            ? this.lines.length
+            : end.endLine
+        const raw = this.joinLines(node.startLine, rawEndLine)
+        nextBlocks.push(this.makeBlock(-1, this.lineStarts[node.startLine - 1]!, raw, "settled", kind, ctx.used, this.parser.refmap, null))
+        newSettledMeta.push({ docIndex: first, lastIndex: last, unresolved: ctx.unresolved })
+      }
+      this.settledNodes = last + 1
+      if (early) break
+    }
 
-      if (this.options.renderHtml) block.html = renderBlockKindToHtml(rb.kind)
-      if (resolvedDefs && !block.raw.includes(resolvedDefs)) block.defs = resolvedDefs
+    // 2. The streaming tail
+    let tailRefmap: RefMap | null = null
+    let tailRefsAdded: string[] = []
+    if (streaming) {
+      const tail = this.buildTail(visible, preFork)
+      tailRefmap = tail.refmap
+      tailRefsAdded = tail.refsAdded
+      for (const block of tail.blocks) nextBlocks.push(block)
+    }
 
-      if (shouldSettle) {
-        this.blocks.push(block)
-        this.settledCount++
-        this.settledOffset = rb.end
-        this.settledListIndents = rb.listIndentsAfter
-
-        if (existingTail) {
-          patches.push({ op: "finalize", id: block.id, index: blockIndex, block })
+    // 3. Reconcile against the previous tail and emit patches
+    const patches: BlockPatch[] = []
+    for (let j = 0; j < nextBlocks.length; j++) {
+      const index = oldSettledCount + j
+      let block = nextBlocks[j]!
+      const prev = prevTail[j]
+      if (prev) {
+        block.id = prev.id
+        if (block.status === "settled") {
+          patches.push({ op: "finalize", id: block.id, index, block })
+        } else if (prev.raw === block.raw && prev.liveRaw === block.liveRaw && prev.status === block.status && prev.defs === block.defs) {
+          block = prev
         } else {
-          patches.push({ op: "append", block })
-          patches.push({ op: "finalize", id: block.id, index: blockIndex, block })
-        }
-
-        if (block.kind.type === "table") {
-          this.tableRowCache.clear()
-          this.activeTableState = null
+          patches.push({ op: "replace", id: block.id, index, block })
         }
       } else {
-        if (existingTail) {
-          if (
-            existingTail.raw !== block.raw ||
-            existingTail.status !== block.status ||
-            existingTail.defs !== block.defs
-          ) {
-            this.blocks.push(block)
-            patches.push({ op: "replace", id: block.id, index: blockIndex, block })
-          } else {
-            this.blocks.push(existingTail)
-          }
-        } else {
-          this.blocks.push(block)
-          patches.push({ op: "append", block })
-        }
+        block.id = this.nextId++
+        patches.push({ op: "append", block })
+        if (block.status === "settled") patches.push({ op: "finalize", id: block.id, index, block })
+      }
+      nextBlocks[j] = block
+    }
+    if (prevTail.length > nextBlocks.length) {
+      patches.push({ op: "truncate", keepCount: oldSettledCount + nextBlocks.length })
+    }
+    this.blocks.length = oldSettledCount
+    for (const block of nextBlocks) this.blocks.push(block)
+    for (const meta of newSettledMeta) {
+      const index = this.settledMeta.length
+      this.settledMeta.push(meta)
+      for (const label of meta.unresolved) {
+        let set = this.waiting.get(label)
+        if (!set) this.waiting.set(label, (set = new Set()))
+        set.add(index)
       }
     }
+    this.settledCount = oldSettledCount + newSettledMeta.length
 
-    // Process any newly discovered or updated reference definitions `[id]: url`
-    for (const rb of rawBlocks) {
-      if (rb.def) {
-        const prev = this.defs.get(rb.def.id)
-
-        if (!prev || prev.href !== rb.def.href || prev.title !== rb.def.title) {
-          this.defs.set(rb.def.id, { href: rb.def.href, title: rb.def.title, raw: rb.def.raw })
-          const waitingIds = this.refToBlockIds.get(rb.def.id)
-
-          if (waitingIds) {
-            for (const blockId of waitingIds) {
-              let idx = -1
-
-              for (let s = 0; s < this.blocks.length; s++) {
-                if (this.blocks[s]!.id === blockId) {
-                  idx = s
-                  break
-                }
-              }
-
-              if (idx >= 0) {
-                const oldBlock = this.blocks[idx]!
-                const reparsed = this.parseSlice(oldBlock.raw, oldBlock.start, false)[0]
-
-                if (reparsed) {
-                  const resolvedDefs = this.resolveDefsForBlock(oldBlock.id)
-                  const updated: MarkdownBlock = {
-                    ...oldBlock,
-                    kind: reparsed.kind,
-                  }
-
-                  if (this.options.renderHtml) updated.html = renderBlockKindToHtml(reparsed.kind)
-                  if (resolvedDefs && !updated.raw.includes(resolvedDefs)) updated.defs = resolvedDefs
-                  this.blocks[idx] = updated
-                  patches.push({ op: "replace", id: updated.id, index: idx, block: updated })
-                }
-              }
-            }
-          }
-        }
-      }
-    }
+    // 4. Reference definitions that arrived after the blocks that use them: patch those blocks
+    this.backfillRefs(patches, tailRefmap, tailRefsAdded)
 
     return {
-      text: this.fullText,
-      settledOffset: this.settledOffset,
+      text: this.text,
+      settledOffset: this.settledOffset(),
       blocks: this.blocks,
       patches,
       heldMarker: held,
-      charsScanned: activeSlice.length,
+      charsScanned: this.fed - before + partial.length,
     }
   }
 
-  private parseSlice(slice: string, baseOffset: number, streaming: boolean): RawParsedBlock[] {
-    if (!slice) return []
-    const results: RawParsedBlock[] = []
+  private backfillRefs(patches: BlockPatch[], tailRefmap: RefMap | null, tailRefsAdded: string[]) {
+    const added = this.parser.refsAdded
+    if (this.refsSeen >= added.length && tailRefsAdded.length === 0) return
+    const touched = new Set<number>()
+    for (let i = this.refsSeen; i < added.length; i++) {
+      const set = this.waiting.get(added[i]!)
+      if (!set) continue
+      for (const idx of set) touched.add(idx)
+      this.waiting.delete(added[i]!)
+    }
+    this.refsSeen = added.length
+    for (const label of tailRefsAdded) {
+      const set = this.waiting.get(label)
+      if (!set) continue
+      for (const idx of set) touched.add(idx)
+    }
+    const refmap = tailRefmap ?? this.parser.refmap
+    for (const idx of [...touched].sort((a, b) => a - b)) {
+      const meta = this.settledMeta[idx]!
+      const ctx: ConvertContext = {
+        refmap,
+        cacheable: false,
+        inTail: false,
+        partialLine: false,
+        healTarget: null,
+        heal: null,
+        used: new Set(),
+        unresolved: new Set(),
+      }
+      const kind = this.convertUnit(this.parser.doc.children, meta.docIndex, meta.lastIndex, ctx)
+      if (!kind) continue
+      const old = this.blocks[idx]!
+      const updated = this.makeBlock(old.id, old.start, old.raw, "settled", kind, ctx.used, refmap, null)
+      meta.unresolved = ctx.unresolved
+      for (const label of ctx.unresolved) {
+        let set = this.waiting.get(label)
+        if (!set) this.waiting.set(label, (set = new Set()))
+        set.add(idx)
+      }
+      for (const label of ctx.used) {
+        if (!this.parser.refmap.has(label)) {
+          let set = this.waiting.get(label)
+          if (!set) this.waiting.set(label, (set = new Set()))
+          set.add(idx)
+        }
+      }
+      let patchedInFrame = false
+      for (const p of patches) {
+        if (p.op !== "truncate" && p.block.id === updated.id) {
+          p.block = updated
+          patchedInFrame = true
+        }
+      }
+      if (patchedInFrame) {
+        this.blocks[idx] = updated
+      } else if (old.defs !== updated.defs || old.html !== updated.html || JSON.stringify(old.kind) !== JSON.stringify(updated.kind)) {
+        this.blocks[idx] = updated
+        patches.push({ op: "replace", id: updated.id, index: idx, block: updated })
+      }
+    }
+  }
 
-    const lineStarts: number[] = []
-    const lineEnds: number[] = []
+  /** Raw source of complete lines `from`..`to` (1-based, inclusive) */
+  private joinLines(from: number, to: number): string {
+    if (to < from) return ""
+    if (from === to) return this.lineRaw[from - 1]!
+    let out = ""
+    for (let i = from - 1; i < to; i++) out += this.lineRaw[i]!
+    return out
+  }
+
+  private pushLine(line: string, raw: string) {
+    this.lineStarts.push(this.fed)
+    this.lines.push(line)
+    this.lineRaw.push(raw)
+    this.fed += raw.length
+  }
+
+  private feedCompleteLines(streaming: boolean) {
+    const partial = this.partial
+    const len = partial.length
     let pos = 0
-    const len = slice.length
-
     while (pos < len) {
-      lineStarts.push(pos)
-      const nl = slice.indexOf("\n", pos)
-
-      if (nl < 0) {
-        lineEnds.push(len)
-        pos = len
-      } else {
-        lineEnds.push(nl + 1)
-        pos = nl + 1
+      let idx = partial.indexOf("\n", pos)
+      const cr = partial.indexOf("\r", pos)
+      if (cr >= 0 && (idx < 0 || cr < idx)) idx = cr
+      if (idx < 0) break
+      let term = 1
+      if (partial.charCodeAt(idx) === 0x0d) {
+        if (idx + 1 < len) term = partial.charCodeAt(idx + 1) === 0x0a ? 2 : 1
+        else if (streaming) break
       }
+      this.pushLine(partial.slice(pos, idx), partial.slice(pos, idx + term))
+      this.parser.incorporateLine(this.lines[this.lines.length - 1]!)
+      pos = idx + term
+      if (this.parser.unclosedMathAt) this.reparse(false)
     }
-
-    const lineCount = lineStarts.length
-    const isLineComplete = (idx: number): boolean => {
-      if (!streaming || idx < lineCount - 1) return true
-
-      return slice.charCodeAt(lineEnds[idx]! - 1) === 0x0a
-    }
-
-    const getLine = (idx: number): string => {
-      let s = slice.slice(lineStarts[idx]!, lineEnds[idx]!)
-      if (s.endsWith("\n")) s = s.slice(0, -1)
-      if (s.endsWith("\r")) s = s.slice(0, -1)
-
-      return s
-    }
-
-    const consumeTrailingBlankLines = (nextIdx: number): number => {
-      let idx = nextIdx
-      while (idx < lineCount && isLineComplete(idx) && getLine(idx).trim().length === 0) {
-        idx++
-      }
-
-      return idx
-    }
-
-    let listIndents: number[] = [...this.settledListIndents]
-    let idx = 0
-
-    while (idx < lineCount) {
-      const line = getLine(idx)
-      const trimmed = line.trim()
-
-      if (trimmed.length === 0) {
-        idx++
-        continue
-      }
-
-      const blockStartLine = idx
-
-      // 1a. Single-line reference link definition `[id]: url "title"`
-      const defMatch = (!this.options.settleOnComplete || isLineComplete(idx)) ? DEF_LINE_RE.exec(line) : null
-
-      if (defMatch) {
-        const nextIdx = consumeTrailingBlankLines(idx + 1)
-        const start = baseOffset + lineStarts[blockStartLine]!
-        const end = baseOffset + lineEnds[nextIdx - 1]!
-        const raw = slice.slice(lineStarts[blockStartLine]!, lineEnds[nextIdx - 1]!)
-        const def: { id: string; href: string; title?: string; raw: string } = {
-          id: defMatch[1]!.toLowerCase(),
-          href: defMatch[2]!,
-          raw,
-        }
-
-        if (defMatch[3]) def.title = defMatch[3]
-        results.push({
-          start,
-          end,
-          raw,
-          kind: { type: "paragraph", inlines: [] },
-          canSettle: true,
-          listIndentsAfter: [...listIndents],
-          def,
-        })
-        idx = nextIdx
-        continue
-      }
-
-      // 1b. Multiline reference link definition `[id]:\n  url`
-      const defOpen = idx + 1 < lineCount ? DEF_OPEN_RE.exec(line) : null
-      const defCont = defOpen ? DEF_CONT_RE.exec(getLine(idx + 1)) : null
-
-      if (defOpen && defCont) {
-        const nextIdx = consumeTrailingBlankLines(idx + 2)
-        const start = baseOffset + lineStarts[blockStartLine]!
-        const end = baseOffset + lineEnds[nextIdx - 1]!
-        const raw = slice.slice(lineStarts[blockStartLine]!, lineEnds[nextIdx - 1]!)
-        const def: { id: string; href: string; title?: string; raw: string } = {
-          id: defOpen[1]!.toLowerCase(),
-          href: defCont[1]!,
-          raw,
-        }
-
-        if (defCont[2]) def.title = defCont[2]
-        results.push({
-          start,
-          end,
-          raw,
-          kind: { type: "paragraph", inlines: [] },
-          canSettle: true,
-          listIndentsAfter: [...listIndents],
-          def,
-        })
-        idx = nextIdx
-        continue
-      }
-
-      // 2. Fenced code block or Mermaid block (```` ``` ```` or `~~~`, top-level or list-indented)
-      const fenceOpen = matchFenceOpen(line)
-
-      if (fenceOpen && (fenceOpen.indent <= 3 || this.options.flatListBlocks || listIndents.length > 0)) {
-        const bodyStartLine = idx + 1
-        let closeLine = -1
-
-        for (let k = bodyStartLine; k < lineCount; k++) {
-          if (
-            (!this.options.settleOnComplete || isLineComplete(k)) &&
-            isFenceClose(getLine(k), fenceOpen.char, fenceOpen.len)
-          ) {
-            closeLine = k
-            break
-          }
-        }
-
-        const complete = closeLine >= 0
-        const endLineExcl = complete ? consumeTrailingBlankLines(closeLine + 1) : lineCount
-        const codeLines: string[] = []
-        const bodyEnd = complete ? closeLine : lineCount
-
-        for (let k = bodyStartLine; k < bodyEnd; k++) {
-          const rawCodeLine = getLine(k)
-          let strip = 0
-          while (strip < fenceOpen.indent && strip < rawCodeLine.length && rawCodeLine.charCodeAt(strip) === 0x20) {
-            strip++
-          }
-          codeLines.push(strip > 0 ? rawCodeLine.slice(strip) : rawCodeLine)
-        }
-
-        const start = baseOffset + lineStarts[blockStartLine]!
-        const end = baseOffset + lineEnds[endLineExcl - 1]!
-        const raw = slice.slice(lineStarts[blockStartLine]!, lineEnds[endLineExcl - 1]!)
-        let source = codeLines.join("\n")
-
-        if (!complete && codeLines.length > 0 && raw.endsWith("\n")) {
-          source += "\n"
-        }
-
-        const isMermaid = fenceOpen.language?.toLowerCase() === "mermaid"
-        let kind: BlockKind
-
-        if (isMermaid) {
-          kind = { type: "mermaid", source, complete }
-        } else {
-          const codeKind: Extract<BlockKind, { type: "code" }> = {
-            type: "code",
-            source,
-            fence: fenceOpen.fence,
-            complete,
-          }
-
-          if (fenceOpen.language) codeKind.language = fenceOpen.language
-          if (fenceOpen.meta) codeKind.meta = fenceOpen.meta
-          if (fenceOpen.indent > 0) codeKind.indented = true
-          kind = codeKind
-        }
-
-        const closeComplete = complete && isLineComplete(closeLine)
-
-        results.push({
-          start,
-          end,
-          raw,
-          kind,
-          canSettle: closeComplete,
-          selfSettled: closeComplete,
-          listIndentsAfter: [...listIndents],
-        })
-        idx = endLineExcl
-        continue
-      }
-
-      // 3. Display math block (`$$...$$` or `\[...\]` or `$\n...\n$`)
-      if (this.options.math && (trimmed.startsWith("$$") || trimmed.startsWith("\\[") || trimmed === "$")) {
-        const isBracket = trimmed.startsWith("\\[")
-        const isSingleDollar = trimmed === "$"
-        const closeDelim = isBracket ? "\\]" : isSingleDollar ? "$" : "$$"
-        const delimType = isBracket ? "bracket" : "double-dollar"
-        const afterOpen = trimmed.slice(closeDelim.length)
-
-        // Single-line display math `$$ ... $$`
-        if (!isSingleDollar && afterOpen.endsWith(closeDelim) && afterOpen.length > closeDelim.length) {
-          const mathSrc = afterOpen.slice(0, -2).trim()
-          const nextIdx = consumeTrailingBlankLines(idx + 1)
-          listIndents = []
-          results.push({
-            start: baseOffset + lineStarts[blockStartLine]!,
-            end: baseOffset + lineEnds[nextIdx - 1]!,
-            raw: slice.slice(lineStarts[blockStartLine]!, lineEnds[nextIdx - 1]!),
-            kind: { type: "math", source: mathSrc, delimiter: delimType, complete: true },
-            canSettle: isLineComplete(idx),
-            selfSettled: isLineComplete(idx),
-            listIndentsAfter: [],
-          })
-          idx = nextIdx
-          continue
-        }
-
-        // Multi-line display math
-        if (!afterOpen.includes(closeDelim)) {
-          let closeLine = -1
-          const mathLines: string[] = afterOpen.trim() ? [afterOpen] : []
-
-          for (let k = idx + 1; k < lineCount; k++) {
-            const mLine = getLine(k).trim()
-
-            if (
-              (!this.options.settleOnComplete || isLineComplete(k)) &&
-              (isSingleDollar ? mLine === "$" : mLine.endsWith(closeDelim))
-            ) {
-              const beforeClose = mLine.slice(0, -closeDelim.length).trim()
-              if (beforeClose) mathLines.push(beforeClose)
-              closeLine = k
-              break
-            }
-
-            mathLines.push(getLine(k))
-          }
-
-          if (closeLine >= 0 || (!isSingleDollar && streaming && idx + 1 <= lineCount)) {
-            const complete = closeLine >= 0
-            const endLineExcl = complete ? consumeTrailingBlankLines(closeLine + 1) : lineCount
-            const closeComplete = complete && isLineComplete(closeLine)
-            listIndents = []
-            results.push({
-              start: baseOffset + lineStarts[blockStartLine]!,
-              end: baseOffset + lineEnds[endLineExcl - 1]!,
-              raw: slice.slice(lineStarts[blockStartLine]!, lineEnds[endLineExcl - 1]!),
-              kind: {
-                type: "math",
-                source: mathLines.join("\n").trim(),
-                delimiter: delimType,
-                complete,
-              },
-              canSettle: closeComplete,
-              selfSettled: closeComplete,
-              listIndentsAfter: [],
-            })
-            idx = endLineExcl
-            continue
-          }
-        }
-      }
-
-      // 4. ATX Heading (`#` .. `######`)
-      if (trimmed.charCodeAt(0) === 0x23 /* # */) {
-        let h = 1
-        while (h < trimmed.length && trimmed.charCodeAt(h) === 0x23) h++
-
-        if (h <= 6 && (h === trimmed.length || trimmed.charCodeAt(h) === 0x20 || trimmed.charCodeAt(h) === 0x09)) {
-          const headingText = trimmed
-            .slice(h)
-            .replace(/[ \t]+#+[ \t]*$/, "")
-            .trim()
-          const nextIdx = consumeTrailingBlankLines(idx + 1)
-          const isTailLine = idx === lineCount - 1 && streaming
-          const unresolved: string[] = []
-          const used: string[] = []
-          const inlines = parseInlines(headingText, this.inlineOpts(isTailLine, unresolved, used))
-          const level = HEADING_LEVELS[h - 1] ?? 6
-          listIndents = []
-          results.push({
-            start: baseOffset + lineStarts[blockStartLine]!,
-            end: baseOffset + lineEnds[nextIdx - 1]!,
-            raw: slice.slice(lineStarts[blockStartLine]!, lineEnds[nextIdx - 1]!),
-            kind: { type: "heading", level, inlines },
-            canSettle: nextIdx > idx + 1 || isLineComplete(idx),
-            selfSettled: nextIdx > idx + 1 || isLineComplete(idx),
-            listIndentsAfter: [],
-            unresolvedRefs: unresolved,
-            usedRefs: used,
-          })
-          idx = nextIdx
-          continue
-        }
-      }
-
-      // 5. Thematic break (`---`, `***`, `___`)
-      if (isThematicBreak(trimmed)) {
-        const nextIdx = consumeTrailingBlankLines(idx + 1)
-        listIndents = []
-        results.push({
-          start: baseOffset + lineStarts[blockStartLine]!,
-          end: baseOffset + lineEnds[nextIdx - 1]!,
-          raw: slice.slice(lineStarts[blockStartLine]!, lineEnds[nextIdx - 1]!),
-          kind: { type: "hr" },
-          canSettle: nextIdx > idx + 1 || !streaming || (idx + 1 < lineCount && isLineComplete(idx + 1)),
-          selfSettled: nextIdx > idx + 1,
-          listIndentsAfter: [],
-        })
-        idx = nextIdx
-        continue
-      }
-
-      // 6. Standalone image `![alt](src)`
-      const img = matchStandaloneImage(trimmed)
-
-      if (img) {
-        const nextIdx = consumeTrailingBlankLines(idx + 1)
-        const imageKind: Extract<BlockKind, { type: "image" }> = {
-          type: "image",
-          alt: img.alt,
-          src: img.src,
-        }
-
-        if (img.title) imageKind.title = img.title
-        listIndents = []
-        results.push({
-          start: baseOffset + lineStarts[blockStartLine]!,
-          end: baseOffset + lineEnds[nextIdx - 1]!,
-          raw: slice.slice(lineStarts[blockStartLine]!, lineEnds[nextIdx - 1]!),
-          kind: imageKind,
-          canSettle: isLineComplete(idx),
-          selfSettled: isLineComplete(idx),
-          listIndentsAfter: [],
-        })
-        idx = nextIdx
-        continue
-      }
-
-      // 7. Blockquote (`> ...`)
-      if (trimmed.charCodeAt(0) === 0x3e /* > */) {
-        const quoteLines: string[] = []
-        let k = idx
-
-        while (k < lineCount) {
-          const qTrim = getLine(k).trim()
-          if (!qTrim.startsWith(">")) break
-          let content = qTrim.slice(1)
-          if (content.startsWith(" ")) content = content.slice(1)
-          quoteLines.push(content)
-          k++
-        }
-
-        const nextIdx = consumeTrailingBlankLines(k)
-        const isTail = nextIdx === lineCount && streaming
-        const unresolved: string[] = []
-        const used: string[] = []
-        const inlines = parseInlines(quoteLines.join("\n"), this.inlineOpts(isTail, unresolved, used))
-        listIndents = []
-        results.push({
-          start: baseOffset + lineStarts[blockStartLine]!,
-          end: baseOffset + lineEnds[nextIdx - 1]!,
-          raw: slice.slice(lineStarts[blockStartLine]!, lineEnds[nextIdx - 1]!),
-          kind: { type: "blockquote", inlines },
-          canSettle: nextIdx > k || (k < lineCount && isLineComplete(k)),
-          selfSettled: nextIdx > k,
-          listIndentsAfter: [],
-          unresolvedRefs: unresolved,
-          usedRefs: used,
-        })
-        idx = nextIdx
-        continue
-      }
-
-      // 8. GFM Pipe Table (`| h1 | h2 |\n|---|---|\n...`)
-      if (
-        this.options.gfm &&
-        trimmed.includes("|") &&
-        idx + 1 < lineCount &&
-        isTableSeparator(getLine(idx + 1).trim())
-      ) {
-        const align = parseTableAlign(getLine(idx + 1))
-        const unresolved: string[] = []
-        const used: string[] = []
-        const headerCells = splitTableCells(trimmed).map((cell) =>
-          parseInlines(cell, this.inlineOpts(false, unresolved, used)),
-        )
-        const rows: InlineNode[][][] = []
-        let k = idx + 2
-
-        while (k < lineCount) {
-          const rLine = getLine(k).trim()
-          if (!rLine || !rLine.includes("|") || matchFenceOpen(rLine) || rLine.startsWith("#")) break
-          const isLastRow = k === lineCount - 1 && streaming
-
-          if (!isLastRow) {
-            const cached = this.tableRowCache.get(rLine)
-
-            if (cached) {
-              rows.push(cached)
-              k++
-              continue
-            }
-          }
-
-          const parsedRow = splitTableCells(rLine).map((cell) =>
-            parseInlines(cell, this.inlineOpts(isLastRow, unresolved, used)),
-          )
-
-          if (!isLastRow) {
-            this.tableRowCache.set(rLine, parsedRow)
-          }
-
-          rows.push(parsedRow)
-          k++
-        }
-
-        const nextIdx = consumeTrailingBlankLines(k)
-        const tableBlockStart = baseOffset + lineStarts[blockStartLine]!
-
-        if (streaming && nextIdx === lineCount && nextIdx === k) {
-          const lastIsCompleteLine = k > idx + 2 && slice.endsWith("\n")
-          const committedCount = lastIsCompleteLine ? rows.length : Math.max(0, rows.length - 1)
-          const committedEndLine = idx + 2 + committedCount
-
-          const committedOffset =
-            committedEndLine > idx + 2
-              ? baseOffset + lineEnds[committedEndLine - 1]!
-              : baseOffset + lineEnds[idx + 1]!
-
-          this.activeTableState = {
-            blockStart: tableBlockStart,
-            committedOffset,
-            align,
-            headers: headerCells,
-            committedRows: rows.slice(0, committedCount),
-          }
-        }
-
-        listIndents = []
-        results.push({
-          start: tableBlockStart,
-          end: baseOffset + lineEnds[nextIdx - 1]!,
-          raw: slice.slice(lineStarts[blockStartLine]!, lineEnds[nextIdx - 1]!),
-          kind: { type: "table", align, headers: headerCells, rows },
-          canSettle: nextIdx > k || (k < lineCount && isLineComplete(k)),
-          selfSettled: nextIdx > k,
-          listIndentsAfter: [],
-          unresolvedRefs: unresolved,
-          usedRefs: used,
-        })
-        idx = nextIdx
-        continue
-      }
-
-      // 9. List item (`- `, `* `, `1. `)
-      const listMatch = matchListMarker(line)
-
-      if (listMatch) {
-        while (listIndents.length > 0 && listIndents[listIndents.length - 1]! > listMatch.indent) {
-          listIndents.pop()
-        }
-
-        if (listIndents[listIndents.length - 1] !== listMatch.indent) {
-          listIndents.push(listMatch.indent)
-        }
-
-        const level = Math.min(listIndents.length - 1, 4)
-
-        let itemContent = listMatch.content
-        let checked: boolean | null = null
-
-        if (this.options.gfm) {
-          if (itemContent.startsWith("[ ] ") || itemContent === "[ ]") {
-            checked = false
-            itemContent = itemContent.slice(3).trimStart()
-          } else if (
-            itemContent.startsWith("[x] ") ||
-            itemContent.startsWith("[X] ") ||
-            itemContent === "[x]" ||
-            itemContent === "[X]"
-          ) {
-            checked = true
-            itemContent = itemContent.slice(3).trimStart()
-          }
-        }
-
-        const itemLines = [itemContent]
-        let k = idx + 1
-
-        while (k < lineCount) {
-          const contLine = getLine(k)
-          const contTrim = contLine.trim()
-
-          if (contTrim.length === 0) {
-            if (!this.options.flatListBlocks) {
-              // Check if blank line(s) are followed by another list item or indented continuation
-              let afterBlank = k + 1
-              while (afterBlank < lineCount && getLine(afterBlank).trim().length === 0) afterBlank++
-
-              if (afterBlank < lineCount) {
-                const nextNonBlank = getLine(afterBlank)
-
-                if (
-                  !matchFenceOpen(nextNonBlank) &&
-                  (matchListMarker(nextNonBlank) ||
-                    nextNonBlank.startsWith("  ") ||
-                    nextNonBlank.startsWith("\t"))
-                ) {
-                  itemLines.push("")
-                  k = afterBlank
-                  continue
-                }
-              }
-            }
-
-            break
-          }
-
-          const nextListMatch = matchListMarker(contLine)
-
-          if (
-            (this.options.flatListBlocks && nextListMatch) ||
-            matchFenceOpen(contLine) ||
-            contTrim.startsWith("#") ||
-            contTrim.startsWith(">") ||
-            (!nextListMatch && isThematicBreak(contTrim)) ||
-            DEF_LINE_RE.test(contLine) ||
-            (this.options.math && (contTrim.startsWith("$$") || contTrim.startsWith("\\["))) ||
-            (this.options.gfm &&
-              contTrim.includes("|") &&
-              k + 1 < lineCount &&
-              isTableSeparator(getLine(k + 1).trim()))
-          ) {
-            break
-          }
-
-          itemLines.push(contTrim)
-          k++
-        }
-
-        const nextIdx = consumeTrailingBlankLines(k)
-        const isTail = nextIdx === lineCount && streaming
-        const unresolved: string[] = []
-        const used: string[] = []
-        const inlines = parseInlines(itemLines.join("\n"), this.inlineOpts(isTail, unresolved, used))
-
-        const listKind: Extract<BlockKind, { type: "list_item" }> = {
-          type: "list_item",
-          ordered: listMatch.ordered,
-          marker: listMatch.marker,
-          level,
-          inlines,
-        }
-
-        if (listMatch.start !== undefined) listKind.start = listMatch.start
-        if (checked !== null) listKind.checked = checked
-
-        results.push({
-          start: baseOffset + lineStarts[blockStartLine]!,
-          end: baseOffset + lineEnds[nextIdx - 1]!,
-          raw: slice.slice(lineStarts[blockStartLine]!, lineEnds[nextIdx - 1]!),
-          kind: listKind,
-          canSettle: nextIdx > k || (k < lineCount && isLineComplete(k)),
-          selfSettled: nextIdx > k,
-          listIndentsAfter: [...listIndents],
-          unresolvedRefs: unresolved,
-          usedRefs: used,
-        })
-        idx = nextIdx
-        continue
-      }
-
-      if (line.charCodeAt(0) !== 0x20 && line.charCodeAt(0) !== 0x09) {
-        listIndents = []
-      }
-
-      // 10. Paragraph (collect lines until blank line or block opener)
-      const paraLines = [line]
-      let k = idx + 1
-      let hitTableStart = false
-
-      while (k < lineCount) {
-        const pLine = getLine(k)
-        const pTrim = pLine.trim()
-        if (pTrim.length === 0) break
-
-        if (
-          matchFenceOpen(pLine) ||
-          pTrim.startsWith("#") ||
-          pTrim.startsWith(">") ||
-          isThematicBreak(pTrim) ||
-          matchListMarker(pLine) ||
-          DEF_LINE_RE.test(pLine) ||
-          (k + 1 < lineCount && DEF_OPEN_RE.test(pLine) && DEF_CONT_RE.test(getLine(k + 1))) ||
-          matchStandaloneImage(pTrim) ||
-          (this.options.math && (pTrim.startsWith("$$") || pTrim.startsWith("\\[") || pTrim === "$"))
-        ) {
-          break
-        }
-
-        if (this.options.gfm && pTrim.includes("|") && k + 1 < lineCount && isTableSeparator(getLine(k + 1).trim())) {
-          hitTableStart = true
-          break
-        }
-
-        paraLines.push(pLine)
-        k++
-      }
-
-      const nextIdx = hitTableStart ? k : consumeTrailingBlankLines(k)
-      const hasBlankLineAfter = nextIdx > k
-      const isTail = nextIdx === lineCount && streaming && !hasBlankLineAfter
-      const mightBecomeTable = paraLines.length === 1 && trimmed.includes("|") && !hasBlankLineAfter
-      const unresolved: string[] = []
-      const used: string[] = []
-      const inlines = parseInlines(paraLines.join("\n"), this.inlineOpts(isTail, unresolved, used))
-
-      results.push({
-        start: baseOffset + lineStarts[blockStartLine]!,
-        end: baseOffset + lineEnds[nextIdx - 1]!,
-        raw: slice.slice(lineStarts[blockStartLine]!, lineEnds[nextIdx - 1]!),
-        kind: { type: "paragraph", inlines },
-        canSettle: !mightBecomeTable && (hasBlankLineAfter || (k < lineCount && isLineComplete(k))),
-        selfSettled: hasBlankLineAfter,
-        listIndentsAfter: [...listIndents],
-        unresolvedRefs: unresolved,
-        usedRefs: used,
-      })
-      idx = nextIdx
-    }
-
-    return results
+    if (pos > 0) this.partial = partial.slice(pos)
   }
 
-  private inlineOpts(streaming: boolean, unresolved: string[], used?: string[]): InlineParseOptions {
-    return {
+  /** An unclosed `$$` block is not math after all: re-read the document with that opener disabled */
+  private reparse(finish: boolean) {
+    while (this.parser.unclosedMathAt) {
+      this.disallowMath.add(this.parser.unclosedMathAt)
+      const parser = new BlockParser({ gfm: this.options.gfm, math: this.options.math }, this.disallowMath)
+      for (let i = 0; i < this.lines.length; i++) {
+        parser.incorporateLine(this.lines[i]!)
+        if (parser.unclosedMathAt) break
+      }
+      if (!parser.unclosedMathAt && finish) parser.finish()
+      this.parser = parser
+      this.cache = new WeakMap()
+      this.itemCache = new WeakMap()
+    }
+    this.refsSeen = Math.min(this.refsSeen, this.parser.refsAdded.length)
+  }
+
+  private buildTail(
+    visible: string,
+    preFork: { fork: BlockParser; tip: BNode } | null,
+  ): { blocks: MarkdownBlock[]; refmap: RefMap | null; refsAdded: string[] } {
+    const children = this.parser.doc.children
+    const last = children[children.length - 1]
+    const openChild = last && last.open ? last : null
+    const openIndex = openChild ? children.length - 1 : -1
+    if (this.settledNodes >= (openChild ? openIndex : children.length) && !openChild && !visible) {
+      return { blocks: [], refmap: null, refsAdded: [] }
+    }
+
+    let fork: BlockParser
+    let tip: BNode
+    if (preFork) {
+      fork = preFork.fork
+      tip = preFork.tip
+    } else {
+      fork = this.parser.fork()
+      if (visible) fork.incorporateLine(visible)
+      tip = fork.tip
+      fork.finish()
+    }
+
+    let healTarget: BNode | null = null
+    let heal: TailHeal | null = null
+    if (this.options.heal && (tip.type === "paragraph" || tip.type === "heading" || tip.type === "table")) {
+      const content = tip.type === "table" ? (tip.rows[tip.rows.length - 1] ?? "") : tip.content
+      if (content) {
+        const h = computeTailHeal(content)
+        if (h.strip > 0 || h.append) {
+          healTarget = tip
+          heal = h
+        }
+      }
+    }
+
+    const lineCount = this.lines.length
+    // closed top-level blocks still waiting on an open HTML group (or settleOnComplete: false), then the fork's blocks
+    const tailNodes = children.slice(this.settledNodes, openChild ? openIndex : children.length)
+    for (const node of fork.doc.children.slice(openChild && openIndex < this.settledNodes ? 1 : 0)) tailNodes.push(node)
+
+    const units: Array<{ first: number; last: number; kind: BlockKind; ctx: ConvertContext }> = []
+    let first = 0
+    while (first < tailNodes.length) {
+      let last = this.groupEnd(tailNodes, first)
+      if (last < 0) last = tailNodes.length - 1
+      const isLastUnit = last === tailNodes.length - 1
+      const ctx: ConvertContext = {
+        refmap: fork.refmap,
+        cacheable: fork.refmap.size === this.parser.refmap.size,
+        inTail: true,
+        partialLine: isLastUnit && visible.length > 0,
+        healTarget,
+        heal,
+        used: new Set(),
+        unresolved: new Set(),
+      }
+      const kind = this.convertUnit(tailNodes, first, last, ctx)
+      if (kind) units.push({ first, last, kind, ctx })
+      first = last + 1
+    }
+
+    const out: MarkdownBlock[] = []
+    for (let u = 0; u < units.length; u++) {
+      const { first: f, last: l, kind, ctx } = units[u]!
+      const node = tailNodes[f]!
+      const end = tailNodes[l]!
+      const isLastVisUnit = u === units.length - 1
+      let raw: string
+      let start: number
+      if (node.startLine > lineCount) {
+        start = this.fed
+        raw = visible
+      } else {
+        start = this.lineStarts[node.startLine - 1]!
+        if (isLastVisUnit && (!this.options.settleOnComplete || l === tailNodes.length - 1)) {
+          raw = this.joinTail(node.startLine, lineCount) + visible
+        } else {
+          const nextStart = !isLastVisUnit ? tailNodes[units[u + 1]!.first]!.startLine - 1 : end.endLine
+          const endLine = !this.options.settleOnComplete ? Math.min(nextStart, lineCount) : Math.min(end.endLine, lineCount)
+          raw = this.joinLines(node.startLine, endLine) + (end.endLine > lineCount ? visible : "")
+        }
+      }
+      const liveRaw = heal !== null && isLastVisUnit && healTarget !== null ? applyTailHeal(raw, heal) : null
+      out.push(this.makeBlock(-1, start, raw, "streaming", kind, ctx.used, fork.refmap, liveRaw))
+    }
+    return { blocks: out, refmap: fork.refmap, refsAdded: fork.refsAdded }
+  }
+
+  /** Index of the last node in the display unit starting at `first`, or -1 if an HTML group is still open */
+  private groupEnd(nodes: BNode[], first: number): number {
+    if (!this.options.groupHtmlBlocks) return first
+    let balance = htmlBalance(nodes[first]!)
+    if (balance <= 0) return first
+    for (let k = first + 1; k < nodes.length; k++) {
+      balance += htmlBalance(nodes[k]!)
+      if (balance <= 0) return k
+    }
+    return -1
+  }
+
+  private convertUnit(nodes: BNode[], first: number, last: number, ctx: ConvertContext): BlockKind | null {
+    if (first === last) return this.convert(nodes[first]!, ctx)
+    const blocks: BlockKind[] = []
+    for (let k = first; k <= last; k++) {
+      const kind = this.convert(nodes[k]!, ctx)
+      if (kind) blocks.push(kind)
+    }
+    return { type: "group", blocks }
+  }
+
+  /** Lines `from`..`to` joined, extending the previous flush's join when the open block is the same */
+  private joinTail(from: number, to: number): string {
+    const cached = this.tailRaw
+    if (cached && cached.startLine === from && cached.upTo <= to) {
+      if (cached.upTo < to) {
+        cached.text += this.joinLines(cached.upTo + 1, to)
+        cached.upTo = to
+      }
+      return cached.text
+    }
+    const text = this.joinLines(from, to)
+    this.tailRaw = { startLine: from, upTo: to, text }
+    return text
+  }
+
+  private makeBlock(
+    id: number,
+    start: number,
+    raw: string,
+    status: "streaming" | "settled",
+    kind: BlockKind,
+    used: Set<string>,
+    refmap: RefMap,
+    liveRaw: string | null,
+  ): MarkdownBlock {
+    const block: MarkdownBlock = { id, start, end: start + raw.length, raw, status, kind }
+    if (used.size > 0) {
+      const defs: string[] = []
+      for (const label of used) {
+        const def = refmap.get(label)
+        if (!def?.raw) continue
+        const defStart =
+          def.line !== undefined ? (def.line <= this.lineStarts.length ? this.lineStarts[def.line - 1]! : this.fed) : -1
+        if (!this.options.settleOnComplete && defStart >= start && defStart < block.end) continue
+        defs.push(def.raw)
+      }
+      if (defs.length > 0) block.defs = defs.join("\n")
+    }
+    if (liveRaw !== null) block.liveRaw = liveRaw
+    if (this.options.renderHtml) block.html = renderBlockKindToHtml(kind, { gfm: this.options.gfm, math: this.options.math })
+    return block
+  }
+
+  private convert(node: BNode, ctx: ConvertContext): BlockKind | null {
+    const persistent = ctx.cacheable && !node.open && !isForkNode(node)
+    if (persistent) {
+      const hit = this.cache.get(node)
+      if (hit && hit.version === ctx.refmap.size) {
+        for (const label of hit.result.used) ctx.used.add(label)
+        for (const label of hit.result.unresolved) ctx.unresolved.add(label)
+        return hit.result.kind
+      }
+      const sub: ConvertContext = { ...ctx, used: new Set(), unresolved: new Set() }
+      const kind = this.convertUncached(node, sub)
+      this.cache.set(node, { version: ctx.refmap.size, result: { kind, used: sub.used, unresolved: sub.unresolved } })
+      for (const label of sub.used) ctx.used.add(label)
+      for (const label of sub.unresolved) ctx.unresolved.add(label)
+      return kind
+    }
+    return this.convertUncached(node, ctx)
+  }
+
+  private inlines(content: string, ctx: ConvertContext): InlineNode[] {
+    return parseInlines(content, {
       gfm: this.options.gfm,
       math: this.options.math,
-      streaming,
-      heal: this.options.heal,
-      defs: this.defs,
-      onUnresolvedRef: (id) => unresolved.push(id),
-      onUsedRef: used ? (id) => used.push(id) : undefined,
+      defs: ctx.refmap as ReadonlyMap<string, ReferenceDef>,
+      onUsedRef: (label) => ctx.used.add(label),
+      onUnresolvedRef: (label) => ctx.unresolved.add(label),
+    })
+  }
+
+  private convertUncached(node: BNode, ctx: ConvertContext): BlockKind | null {
+    const healHere = ctx.healTarget === node && ctx.heal !== null
+    switch (node.type) {
+      case "paragraph": {
+        if (node.defsOnly) return null
+        const content = healHere ? applyTailHeal(node.content, ctx.heal!) : node.content
+        return { type: "paragraph", inlines: this.inlines(content, ctx) }
+      }
+      case "heading": {
+        const content = healHere ? applyTailHeal(node.content, ctx.heal!) : node.content
+        return { type: "heading", level: node.level as HeadingLevel, inlines: this.inlines(content, ctx) }
+      }
+      case "thematic_break":
+        return { type: "hr" }
+      case "code_block": {
+        const literal = node.open ? codeLiteralSoFar(node) : node.literal
+        const info = node.open && node.isFenced ? unescapeInfo(node.content) : node.info
+        const words = info ? info.split(/\s+/) : []
+        const language = words[0] || undefined
+        const meta = language ? info.slice(info.indexOf(language) + language.length).trim() || undefined : undefined
+        // an indented code block is complete only once the persistent parser has closed it
+        const complete = node.isFenced ? node.fenceClosed : !node.open && !node.forked
+        const keepTrailingNewline = ctx.inTail && node.isFenced && !complete && !ctx.partialLine
+        const source = !keepTrailingNewline && literal.endsWith("\n") ? literal.slice(0, -1) : literal
+        const defaultHtmlLiteral = source ? (source.endsWith("\n") && !complete ? source : `${source}\n`) : ""
+        const htmlLiteral = literal !== defaultHtmlLiteral ? literal : undefined
+        if (language && language.toLowerCase() === "mermaid") {
+          return { type: "mermaid", source, complete, ...(htmlLiteral !== undefined ? { htmlLiteral } : {}) }
+        }
+        return {
+          type: "code",
+          ...(language ? { language } : {}),
+          ...(meta ? { meta } : {}),
+          source,
+          fence: node.isFenced ? node.fenceChar.repeat(node.fenceLength) : "",
+          ...(node.isFenced ? {} : { indented: true }),
+          complete,
+          ...(htmlLiteral !== undefined ? { htmlLiteral } : {}),
+        }
+      }
+      case "html_block":
+        return { type: "html_block", raw: node.open ? node.content.replace(/\n$/, "") : node.literal }
+      case "math_block": {
+        const literal = node.open ? node.content.slice(node.content.indexOf("\n") + 1) : node.literal
+        return {
+          type: "math",
+          source: literal.trim(),
+          delimiter: node.mathDelimiter === "$" ? "dollar" : "double-dollar",
+          complete: node.mathClosed,
+        }
+      }
+      case "block_quote": {
+        const blocks: BlockKind[] = []
+        for (const child of node.children) {
+          const kind = this.convert(child, ctx)
+          if (kind) blocks.push(kind)
+        }
+        return { type: "blockquote", inlines: [], blocks }
+      }
+      case "list": {
+        const ld = node.listData!
+        const items: ListItemNode[] = []
+        for (const item of node.children) items.push(this.convertItemCached(item, ctx))
+        return {
+          type: "list",
+          ordered: ld.type === "ordered",
+          marker: ld.type === "ordered" ? ld.delimiter! : ld.bulletChar!,
+          ...(ld.type === "ordered" ? { start: ld.start! } : {}),
+          tight: ld.tight,
+          items,
+        }
+      }
+      case "item": {
+        const item = this.convertItem(node, ctx)
+        return { type: "blockquote", inlines: [], blocks: item.blocks }
+      }
+      case "table": {
+        const width = node.header.length
+        const version = ctx.cacheable ? ctx.refmap.size : -1
+        const cells = (key: string, split: string[], cacheable: boolean): InlineNode[][] => {
+          const hit = cacheable && version >= 0 ? node.rowCache.get(key) : undefined
+          if (hit && hit.version === version) {
+            for (const label of hit.used) ctx.used.add(label)
+            for (const label of hit.unresolved) ctx.unresolved.add(label)
+            return hit.cells as InlineNode[][]
+          }
+          const sub: ConvertContext = { ...ctx, used: new Set(), unresolved: new Set() }
+          const row: InlineNode[][] = []
+          for (let c = 0; c < width; c++) row.push(c < split.length ? this.inlines(unescapePipes(split[c]!), sub) : [])
+          if (cacheable && version >= 0) {
+            node.rowCache.set(key, { version, cells: row, used: [...sub.used], unresolved: [...sub.unresolved] })
+          }
+          for (const label of sub.used) ctx.used.add(label)
+          for (const label of sub.unresolved) ctx.unresolved.add(label)
+          return row
+        }
+        const headers = cells("\u0000header", node.header, true)
+        const rows: InlineNode[][][] = []
+        for (let r = 0; r < node.rows.length; r++) {
+          let rowText = node.rows[r]!
+          const healRow = healHere && r === node.rows.length - 1
+          if (healRow) rowText = applyTailHeal(rowText, ctx.heal!)
+          const hit = healRow ? undefined : node.rowCache.get(rowText)
+          rows.push(cells(rowText, hit && hit.version === version ? [] : splitTableRow(rowText), !healRow))
+        }
+        return { type: "table", align: node.align, headers, rows }
+      }
+      case "document":
+        return null
     }
   }
+
+  private convertItemCached(item: BNode, ctx: ConvertContext): ListItemNode {
+    if (!ctx.cacheable || item.open || item.forked) return this.convertItem(item, ctx)
+    const version = ctx.refmap.size
+    const hit = this.itemCache.get(item)
+    if (hit && hit.version === version) {
+      for (const label of hit.used) ctx.used.add(label)
+      for (const label of hit.unresolved) ctx.unresolved.add(label)
+      return hit.item
+    }
+    const sub: ConvertContext = { ...ctx, used: new Set(), unresolved: new Set() }
+    const result = this.convertItem(item, sub)
+    this.itemCache.set(item, { version, item: result, used: sub.used, unresolved: sub.unresolved })
+    for (const label of sub.used) ctx.used.add(label)
+    for (const label of sub.unresolved) ctx.unresolved.add(label)
+    return result
+  }
+
+  private convertItem(item: BNode, ctx: ConvertContext): ListItemNode {
+    const blocks: BlockKind[] = []
+    let checked: boolean | undefined
+    const children = item.children
+    for (let i = 0; i < children.length; i++) {
+      const child = children[i]!
+      if (i === 0 && this.options.gfm && child.type === "paragraph" && !child.defsOnly) {
+        const task = matchTask(child.content)
+        if (task) {
+          checked = task.checked
+          const content = task.rest
+          const leadingBr = /^[ ]+\n/.test(content)
+          const leadingWs = leadingBr ? "" : (content.match(/^[ \t]+(?=[^\s])/)?.[0] ?? "")
+          const healed = ctx.healTarget === child && ctx.heal ? applyTailHeal(content, ctx.heal) : content
+          const inlines = this.inlines(healed, ctx)
+          if (leadingBr) {
+            inlines.unshift({ type: "br" })
+          } else if (leadingWs && inlines.length > 0) {
+            if (inlines[0]!.type === "text") {
+              inlines[0] = { type: "text", text: leadingWs + inlines[0]!.text }
+            } else {
+              inlines.unshift({ type: "text", text: leadingWs })
+            }
+          }
+          blocks.push({ type: "paragraph", inlines })
+          continue
+        }
+      }
+      const kind = this.convert(child, ctx)
+      if (kind) blocks.push(kind)
+    }
+    return { ...(checked !== undefined ? { checked } : {}), blocks }
+  }
+}
+
+const VOID_TAGS = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"])
+const RE_TAG = /<(\/?)([A-Za-z][A-Za-z0-9-]*)\b[^>]*?(\/?)>/g
+
+/** Open minus closed (non-void) tags in an HTML block */
+function htmlBalance(node: BNode): number {
+  if (node.type !== "html_block") return 0
+  const html = node.open ? node.content : node.literal
+  let balance = 0
+  for (const m of html.matchAll(RE_TAG)) {
+    if (m[3] || VOID_TAGS.has(m[2]!.toLowerCase())) continue
+    balance += m[1] ? -1 : 1
+  }
+  return balance
+}
+
+function isForkNode(node: BNode): boolean {
+  return node.forked
+}
+
+function codeLiteralSoFar(node: BNode): string {
+  if (!node.isFenced) {
+    const lines = node.content.split("\n")
+    while (lines.length > 0 && /^[ \t]*$/.test(lines[lines.length - 1]!)) lines.pop()
+    return lines.length > 0 ? lines.join("\n") + "\n" : ""
+  }
+  const nl = node.content.indexOf("\n")
+  return nl < 0 ? "" : node.content.slice(nl + 1)
+}
+
+function unescapeInfo(content: string): string {
+  const nl = content.indexOf("\n")
+  return unescapeString((nl < 0 ? content : content.slice(0, nl)).trim())
+}
+
+function unescapePipes(cell: string): string {
+  return cell.includes("\\|") ? cell.replace(/\\\|/g, "|") : cell
+}
+
+function matchTask(content: string): { checked: boolean; rest: string } | null {
+  if (content.length < 4 || content.charCodeAt(0) !== 0x5b || content.charCodeAt(2) !== 0x5d) return null
+  const mark = content[1]!
+  if (mark !== " " && mark !== "x" && mark !== "X") return null
+  const after = content.charCodeAt(3)
+  if (after !== 0x20 && after !== 0x09 && after !== 0x0a) return null
+  if (content.slice(3).trim().length === 0) return null
+  return { checked: mark !== " ", rest: content.slice(4) }
 }
 
 export function createMarkdownStream(options?: StreamOptions): PatchmarkStream {

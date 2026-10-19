@@ -246,7 +246,7 @@ describe("markdown stream", () => {
     })
   })
 
-  test("splits list-indented code fences into standalone code blocks while keeping preceding list items settled", () => {
+  test("keeps list-indented code fences inside the list so numbering and nested indentation match CommonMark", () => {
     const first = project(
       undefined,
       "1. First step\n   ```ts\n   const x = 1\n   ```\n2. Second step\n   ```ts\n   const y = 2",
@@ -254,31 +254,28 @@ describe("markdown stream", () => {
     )
 
     expect(first.blocks).toEqual([
-      { raw: "1. First step\n", src: "1. First step\n", mode: "full" },
-      { raw: "   ```ts\n   const x = 1\n   ```\n", src: "const x = 1", mode: "code", language: "ts", complete: true },
-      { raw: "2. Second step\n", src: "2. Second step\n", mode: "full" },
-      { raw: "   ```ts\n   const y = 2", src: "const y = 2", mode: "code", language: "ts" },
+      {
+        raw: "1. First step\n   ```ts\n   const x = 1\n   ```\n2. Second step\n   ```ts\n   const y = 2",
+        src: "1. First step\n   ```ts\n   const x = 1\n   ```\n2. Second step\n   ```ts\n   const y = 2",
+        mode: "live",
+      },
     ])
 
     const next = project(first, `${first.text}\n   const z = 3`, true)
-    expect(next.blocks[0]).toBe(first.blocks[0])
-    expect(next.blocks[1]).toBe(first.blocks[1])
-    expect(next.blocks[2]).toBe(first.blocks[2])
     expect(next.patches).toEqual([
       {
         op: "replace",
-        index: 3,
+        index: 0,
         block: {
-          raw: "   ```ts\n   const y = 2\n   const z = 3",
-          src: "const y = 2\nconst z = 3",
-          mode: "code",
-          language: "ts",
+          raw: "1. First step\n   ```ts\n   const x = 1\n   ```\n2. Second step\n   ```ts\n   const y = 2\n   const z = 3",
+          src: "1. First step\n   ```ts\n   const x = 1\n   ```\n2. Second step\n   ```ts\n   const y = 2\n   const z = 3",
+          mode: "live",
         },
       },
     ])
   })
 
-  test("back-patches only the block referencing a late reference definition without collapsing unrelated settled blocks", () => {
+  test("back-patches only the block referencing a late reference definition and preserves definitions on finalize", () => {
     const first = project(
       undefined,
       "Read [docs][1].\n\nUnrelated settled paragraph.\n\nTrailing paragraph",
@@ -295,6 +292,13 @@ describe("markdown stream", () => {
     const next = project(first, `${first.text}\n\n[1]: https://example.com/docs`, true)
     expect(next.blocks[1]).toBe(first.blocks[1])
     expect(next.blocks[0]).toEqual({
+      raw: "Read [docs][1].\n\n",
+      src: "Read [docs][1].\n\n\n\n[1]: https://example.com/docs",
+      mode: "full",
+    })
+
+    const done = project(next, next.text, false)
+    expect(done.blocks[0]).toEqual({
       raw: "Read [docs][1].\n\n",
       src: "Read [docs][1].\n\n\n\n[1]: https://example.com/docs",
       mode: "full",

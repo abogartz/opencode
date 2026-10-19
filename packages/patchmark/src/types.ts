@@ -8,12 +8,18 @@ export type InlineNode =
   | { type: "code"; text: string; isFilePath?: boolean; isUrl?: boolean }
   | { type: "math"; source: string; delimiter: MathDelimiter; display: boolean }
   | { type: "link"; href: string; title?: string; children: InlineNode[]; pending?: boolean }
-  | { type: "image"; src: string; alt: string; title?: string }
+  | { type: "image"; src: string; alt: string; title?: string; children?: InlineNode[] }
+  | { type: "html_inline"; raw: string }
   | { type: "br" }
 
 export type TableAlign = "left" | "center" | "right" | null
 
 export type HeadingLevel = 1 | 2 | 3 | 4 | 5 | 6
+
+export interface ListItemNode {
+  checked?: boolean | null
+  blocks: BlockKind[]
+}
 
 export type BlockKind =
   | {
@@ -30,6 +36,7 @@ export type BlockKind =
       language?: string
       meta?: string
       source: string
+      htmlLiteral?: string
       fence: string
       indented?: boolean
       complete: boolean
@@ -37,17 +44,27 @@ export type BlockKind =
   | {
       type: "mermaid"
       source: string
+      htmlLiteral?: string
       complete: boolean
     }
   | {
       type: "math"
       source: string
-      delimiter: "double-dollar" | "bracket"
+      delimiter: "double-dollar" | "dollar" | "bracket"
       complete: boolean
     }
   | {
       type: "blockquote"
       inlines: InlineNode[]
+      blocks?: BlockKind[]
+    }
+  | {
+      type: "list"
+      ordered: boolean
+      marker: string
+      start?: number
+      tight: boolean
+      items: ListItemNode[]
     }
   | {
       type: "list_item"
@@ -57,6 +74,7 @@ export type BlockKind =
       level: number
       checked?: boolean | null
       inlines: InlineNode[]
+      blocks?: BlockKind[]
     }
   | {
       type: "table"
@@ -65,7 +83,16 @@ export type BlockKind =
       rows: InlineNode[][][]
     }
   | {
+      type: "html_block"
+      raw: string
+    }
+  | {
       type: "hr"
+    }
+  | {
+      /** Consecutive top-level blocks kept together because an HTML block opened a tag a later block closes */
+      type: "group"
+      blocks: BlockKind[]
     }
   | {
       type: "image"
@@ -89,8 +116,10 @@ export interface MarkdownBlock {
   kind: BlockKind
   /** Lazily or eagerly rendered HTML when requested */
   html?: string
-  /** Resolved reference link definition lines attached for downstream Markdown renderers */
+  /** Source of the reference definitions this block uses, for renderers that parse one block at a time */
   defs?: string
+  /** For a streaming block: `raw` with the tail healed (open markers closed, dangling markers hidden) */
+  liveRaw?: string
 }
 
 export type BlockPatch =
@@ -123,10 +152,15 @@ export interface StreamOptions {
   heal?: boolean
   /** Hold bare trailing block markers (-, ##, 1., >) until their first word arrives (default: true) */
   holdPendingMarkers?: boolean
-  /** Split top-level list items & list-indented code fences into individual blocks for O(1) list streaming (default: true) */
+  /** @deprecated Ignored: lists are always kept whole, as CommonMark requires */
   flatListBlocks?: boolean
-  /** Settle self-contained tail blocks (headings, closed fences, blank-line-terminated blocks) before the next block starts (default: true) */
+  /** @deprecated Ignored: top-level blocks settle exactly when CommonMark closes them */
   settleOnComplete?: boolean
+  /**
+   * Keep an HTML block that opens a tag (e.g. `<details>`) together with the following blocks up to the block that
+   * closes it, as one `group` block. For renderers that turn each block into a DOM fragment (default: false).
+   */
+  groupHtmlBlocks?: boolean
   /** Eagerly populate `block.html` on each emitted block (default: false) */
   renderHtml?: boolean
 }

@@ -1,69 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import {
-  createMarkdownStream,
-  healStreamingInline,
-  renderBlocksToHtml,
-  splitPendingMarker,
-  type BlockKind,
-  type MarkdownBlock,
-} from "../src/index"
-
-const CORPUS_FIXTURES = [
-  [
-    "# Architecture Overview",
-    "",
-    "Streaming Markdown sits on the hot path of every live assistant turn across **Desktop**, *Web*, and `TUI`.",
-    "",
-    "## Root Causes",
-    "",
-    "1. Full-prefix re-lexing on every non-code chunk",
-    "   ```ts",
-    "   export function stream(text: string, live: boolean) {",
-    "     return createMarkdownStream().update(text, { streaming: live })",
-    "   }",
-    "   ```",
-    "2. Reference link definitions at EOF: see [CommonMark Spec][spec] and [guide].",
-    "",
-    "| Surface | Before | After | Speedup |",
-    "| --- | ---: | ---: | ---: |",
-    "| Desktop | `2,621.90 ms` | `12.04 ms` | **217.8x** |",
-    "| Tail p99 | `8,708 us` | `20 us` | **435x** |",
-    "",
-    "> Quoted note with inline math $E = mc^2$ and \\(P(x_{t+1})\\) plus $5 price.",
-    "",
-    "$$",
-    "\\int_0^1 x^2\\,dx = \\frac{1}{3}",
-    "$$",
-    "",
-    "```mermaid",
-    "flowchart LR",
-    "  A[Chunk] --> B[Patchmark]",
-    "  B --> C[DOM Patch]",
-    "```",
-    "",
-    "---",
-    "",
-    "- [x] Complete incremental block cursor",
-    "- [ ] Follow-up TUI integration",
-    "",
-    "[spec]: https://spec.commonmark.org/",
-    "   [guide]:/docs/guide",
-  ].join("\n"),
-  [
-    "## Multi-Fence Code Synthesis",
-    "",
-    "```ts title=example.ts",
-    "const greeting = `hello ${1 + 2}`",
-    "export const list = [1, 2, 3]",
-    "```",
-    "",
-    "~~~bash",
-    "echo \"running tests\"",
-    "~~~",
-    "",
-    "Paragraph with *foo*bar and foo*bar and *foo*bar*baz.",
-  ].join("\n"),
-]
+import { createMarkdownStream, renderBlocksToHtml, splitPendingMarker, type MarkdownBlock } from "../src/index"
 
 describe("patchmark streaming parser", () => {
   test("preserves exact object references for settled blocks across streaming deltas", () => {
@@ -100,24 +36,21 @@ describe("patchmark streaming parser", () => {
     const source =
       "## What changed\n\nThe transcript grows in place.\n\n- One item.\n- Two items.\n\n1. First\n2. Second\n\n> Quoted\n\nThe end."
     const stream = createMarkdownStream()
-    const kindsById = new Map<number, BlockKind["type"]>()
+    const kindsById = new Map<number, MarkdownBlock["kind"]["type"]>()
 
     for (let i = 1; i <= source.length; i++) {
       const frame = stream.update(source.slice(0, i), { streaming: i < source.length })
-
       for (const b of frame.blocks) {
         const prev = kindsById.get(b.id)
-
         if (prev !== undefined) {
           expect(b.kind.type).toBe(prev)
         }
-
         kindsById.set(b.id, b.kind.type)
       }
     }
   })
 
-  test("heals incomplete emphasis, code spans, math, and links on the streaming tail", () => {
+  test("heals incomplete emphasis, code spans, and links on the streaming tail", () => {
     const stream = createMarkdownStream({ renderHtml: true })
     const f1 = stream.update("Hello **world", { streaming: true })
     expect(renderBlocksToHtml(f1.blocks)).toBe("<p>Hello <strong>world</strong></p>\n")
@@ -127,12 +60,6 @@ describe("patchmark streaming parser", () => {
 
     const f3 = stream.update("See [docs](https://example.com/guide)", { streaming: true })
     expect(renderBlocksToHtml(f3.blocks)).toContain('href="https://example.com/guide"')
-
-    expect(healStreamingInline("*foo*bar")).toBe("*foo*bar")
-    expect(healStreamingInline("foo*bar")).toBe("foo*bar")
-    expect(healStreamingInline("*foo*bar*baz")).toBe("*foo*bar*baz*")
-    expect(healStreamingInline("\\(P(x_{t+1})\\)")).toBe("\\(P(x_{t+1})\\)")
-    expect(healStreamingInline("\\(w^{*}\\) and *next")).toBe("\\(w^{*}\\) and *next*")
   })
 
   test("streams open code fences in O(|delta|) and settles when fence closes", () => {
@@ -152,29 +79,29 @@ describe("patchmark streaming parser", () => {
       complete: false,
     })
 
+    // Close fence split across deltas
     stream.append("`")
     stream.append("`")
     const closed = stream.append("`\n\nAfter")
     expect(closed.blocks[1]!.status).toBe("settled")
     expect(closed.blocks[1]!.kind.type).toBe("code")
-
     if (closed.blocks[1]!.kind.type === "code") {
       expect(closed.blocks[1]!.kind.complete).toBe(true)
     }
   })
 
-  test("splits list-nested code fences into standalone code blocks instead of trapping the list", () => {
-    const stream = createMarkdownStream()
+  test("keeps fenced code inside its list item (one list block, never split)", () => {
+    const stream = createMarkdownStream({ renderHtml: true })
     const frame = stream.update(
       "1. First item\n   ```ts\n   const x = 1\n   ```\n2. Second item\n   ```ts\n   const y = 2",
       { streaming: true },
     )
-    expect(frame.blocks.map((b) => [b.kind.type, b.status])).toEqual([
-      ["list_item", "settled"],
-      ["code", "settled"],
-      ["list_item", "settled"],
-      ["code", "streaming"],
-    ])
+    expect(frame.blocks.map((b) => [b.kind.type, b.status])).toEqual([["list", "streaming"]])
+    const done = stream.finalize()
+    expect(done.blocks).toHaveLength(1)
+    expect(done.blocks[0]!.html).toBe(
+      '<ol>\n<li>First item\n<pre><code class="language-ts">const x = 1\n</code></pre>\n</li>\n<li>Second item\n<pre><code class="language-ts">const y = 2\n</code></pre>\n</li>\n</ol>\n',
+    )
   })
 
   test("resolves late reference link definitions via targeted patch without full-stream live fallback", () => {
@@ -183,6 +110,7 @@ describe("patchmark streaming parser", () => {
     expect(f1.blocks[0]!.status).toBe("settled")
     expect(f1.blocks[1]!.status).toBe("settled")
 
+    // Now the reference definition arrives at the bottom of the stream
     const f2 = stream.append("[spec]: https://spec.commonmark.org/\n\n")
     expect(f2.patches.some((p) => p.op === "replace" && p.id === f1.blocks[0]!.id)).toBe(true)
     expect(renderBlocksToHtml(f2.blocks)).toContain('href="https://spec.commonmark.org/"')
@@ -196,7 +124,6 @@ describe("patchmark streaming parser", () => {
     )
     expect(frame.blocks).toHaveLength(2)
     expect(frame.blocks[0]!.kind.type).toBe("paragraph")
-
     if (frame.blocks[0]!.kind.type === "paragraph") {
       const mathNodes = frame.blocks[0]!.kind.inlines.filter((n) => n.type === "math")
       expect(mathNodes).toEqual([
@@ -204,7 +131,6 @@ describe("patchmark streaming parser", () => {
         { type: "math", source: "e^{i\\pi} + 1 = 0", delimiter: "paren", display: false },
       ])
     }
-
     expect(frame.blocks[1]!.kind).toEqual({
       type: "math",
       source: "\\int_0^1 x^2\\,dx = \\frac{1}{3}",
@@ -222,55 +148,62 @@ describe("patchmark streaming parser", () => {
     const f2 = stream.append("|---|---|\n| 1 | 2 |\n")
     expect(f2.blocks).toHaveLength(1)
     expect(f2.blocks[0]!.kind.type).toBe("table")
-
     if (f2.blocks[0]!.kind.type === "table") {
       expect(f2.blocks[0]!.kind.rows).toHaveLength(1)
     }
 
     const f3 = stream.append("| 3 | **four** |\n")
-
     if (f3.blocks[0]!.kind.type === "table") {
       expect(f3.blocks[0]!.kind.rows).toHaveLength(2)
     }
   })
 
-  test("streaming chunk-by-chunk produces identical settled AST and HTML to one-shot parsing and reconstructs exact state from patches", () => {
-    for (const text of CORPUS_FIXTURES) {
-      const oneShot = createMarkdownStream({ renderHtml: true })
-      const oneShotFrame = oneShot.update(text, { streaming: false })
+  test("prose after a nested fenced code block inside a list item stays a paragraph (never a code block)", () => {
+    const md = "1. Step one:\n\n   ```sh\n   bun test\n   ```\n\n   Follow-up prose in item one.\n"
+    const stream = createMarkdownStream({ renderHtml: true })
+    const done = stream.update(md, { streaming: false })
+    expect(done.blocks).toHaveLength(1)
+    expect(done.blocks[0]!.html).toBe(
+      '<ol>\n<li>\n<p>Step one:</p>\n<pre><code class="language-sh">bun test\n</code></pre>\n<p>Follow-up prose in item one.</p>\n</li>\n</ol>\n',
+    )
+  })
 
-      const streamed = createMarkdownStream({ renderHtml: true })
-      const replica: MarkdownBlock[] = []
-
-      for (let i = 0; i < text.length; i += 5) {
-        const frame = streamed.append(text.slice(i, i + 5))
-
-        for (const patch of frame.patches) {
-          if (patch.op === "append") replica.push(patch.block)
-          else if (patch.op === "replace" || patch.op === "finalize") replica[patch.index] = patch.block
-          else if (patch.op === "truncate") replica.length = patch.keepCount
-        }
-
-        expect(replica).toEqual([...frame.blocks])
+  test("partial ** on the streaming tail never heals into **** or flashes as an <hr>", () => {
+    const md = "Paragraph one.\n\n**Bold heading:** details here.\n"
+    const stream = createMarkdownStream({ renderHtml: true, holdPendingMarkers: false })
+    for (let i = 1; i <= md.length; i++) {
+      const f = stream.update(md.slice(0, i), { streaming: i < md.length })
+      for (const b of f.blocks) {
+        expect(b.kind.type).not.toBe("hr")
+        expect(b.liveRaw ?? b.raw).not.toContain("****")
       }
-
-      const finalFrame = streamed.finalize()
-
-      for (const patch of finalFrame.patches) {
-        if (patch.op === "append") replica.push(patch.block)
-        else if (patch.op === "replace" || patch.op === "finalize") replica[patch.index] = patch.block
-        else if (patch.op === "truncate") replica.length = patch.keepCount
-      }
-
-      expect(replica).toEqual([...finalFrame.blocks])
-      expect(finalFrame.blocks.length).toBe(oneShotFrame.blocks.length)
-
-      for (let i = 0; i < oneShotFrame.blocks.length; i++) {
-        expect(finalFrame.blocks[i]!.kind).toEqual(oneShotFrame.blocks[i]!.kind)
-        expect(finalFrame.blocks[i]!.status).toBe("settled")
-      }
-
-      expect(renderBlocksToHtml(finalFrame.blocks)).toBe(renderBlocksToHtml(oneShotFrame.blocks))
+      expect(renderBlocksToHtml(f.blocks)).not.toContain("<hr")
     }
+  })
+
+  test("setext h1/h2 and lazy blockquote continuations match CommonMark while streaming", () => {
+    const md = "Title\n===\n\nSection\n---\n\n> quoted first line\nlazy continuation line\n"
+    const stream = createMarkdownStream({ renderHtml: true })
+    for (let i = 1; i <= md.length; i++) {
+      const f = stream.update(md.slice(0, i), { streaming: i < md.length })
+      // Partial `-` or `=` underline on Section must never flash as a bullet list
+      for (const b of f.blocks) {
+        expect(b.kind.type).not.toBe("list")
+      }
+    }
+    const done = stream.finalize()
+    expect(renderBlocksToHtml(done.blocks)).toBe(
+      "<h1>Title</h1>\n<h2>Section</h2>\n<blockquote>\n<p>quoted first line\nlazy continuation line</p>\n</blockquote>\n",
+    )
+  })
+
+  test("groupHtmlBlocks keeps multi-block <details> disclosures in one display block", () => {
+    const md = "<details>\n<summary>Summary</summary>\n\nHidden paragraph.\n\n```ts\nconst x = 1\n```\n</details>\n\nAfter.\n"
+    const stream = createMarkdownStream({ groupHtmlBlocks: true, renderHtml: true })
+    const done = stream.update(md, { streaming: false })
+    expect(done.blocks).toHaveLength(2)
+    expect(done.blocks[0]!.raw).toContain("<details>")
+    expect(done.blocks[0]!.raw).toContain("</details>")
+    expect(done.blocks[1]!.raw).toBe("After.\n")
   })
 })

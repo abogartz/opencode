@@ -684,7 +684,7 @@ export function Markdown(
           if (block.mode === "full") {
             const settled = settledMarkdown.get(blockKey)
 
-            if (settled?.raw === block.raw) {
+            if (settled && (settled.src ?? settled.raw) === block.src) {
               if (key) {
                 const cached = getCachedMarkdown(key)
 

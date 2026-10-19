@@ -1,893 +1,1233 @@
-import type { InlineNode } from "./types"
+// CommonMark 0.31.2 inline parser (a port of commonmark.js's delimiter-stack and bracket-stack algorithm),
+// extended with GFM strikethrough and extended autolinks, and OpenCode's `$…$`, `$$…$$`, and `\(…\)` math.
+import { decodeEntity, ENTITY_PATTERN, ESCAPABLE, normalizeURI, unescapeString } from "./entities"
+import type { InlineNode, MathDelimiter } from "./types"
+
+export { healStreamingInline } from "./heal"
 
 export interface ReferenceDef {
   href: string
   title?: string
+  /** Source text of the definition (container prefixes stripped), for renderers that re-parse a block on its own */
   raw?: string
+  /** 1-based start line of the paragraph that defined this reference */
+  line?: number
 }
+
+export type RefMap = Map<string, ReferenceDef>
 
 export interface InlineParseOptions {
   gfm?: boolean
   math?: boolean
+  /** Kept for API compatibility; healing now happens on block content before inline parsing */
   streaming?: boolean
   heal?: boolean
   defs?: ReadonlyMap<string, ReferenceDef>
-  onUnresolvedRef?: (refId: string) => void
-  onUsedRef?: (refId: string) => void
+  /** Called with the normalized label of every reference lookup that found no definition */
+  onUnresolvedRef?: (label: string) => void
+  /** Called with the normalized label of every reference lookup that resolved */
+  onUsedRef?: (label: string) => void
 }
+
+const C_NEWLINE = 10
+const C_ASTERISK = 42
+const C_UNDERSCORE = 95
+const C_BACKTICK = 96
+const C_OPEN_BRACKET = 91
+const C_CLOSE_BRACKET = 93
+const C_LESSTHAN = 60
+const C_BANG = 33
+const C_BACKSLASH = 92
+const C_AMPERSAND = 38
+const C_OPEN_PAREN = 40
+const C_CLOSE_PAREN = 41
+const C_COLON = 58
+const C_TILDE = 126
+const C_DOLLAR = 36
+
+const ESCAPED_CHAR = "\\\\" + ESCAPABLE
+const TAGNAME = "[A-Za-z][A-Za-z0-9-]*"
+const ATTRIBUTENAME = "[a-zA-Z_:][a-zA-Z0-9:._-]*"
+const UNQUOTEDVALUE = "[^\"'=<>`\\x00-\\x20]+"
+const SINGLEQUOTEDVALUE = "'[^']*'"
+const DOUBLEQUOTEDVALUE = '"[^"]*"'
+const ATTRIBUTEVALUE = "(?:" + UNQUOTEDVALUE + "|" + SINGLEQUOTEDVALUE + "|" + DOUBLEQUOTEDVALUE + ")"
+const ATTRIBUTEVALUESPEC = "(?:\\s*=\\s*" + ATTRIBUTEVALUE + ")"
+const ATTRIBUTE = "(?:\\s+" + ATTRIBUTENAME + ATTRIBUTEVALUESPEC + "?)"
+export const OPENTAG = "<" + TAGNAME + ATTRIBUTE + "*\\s*/?>"
+export const CLOSETAG = "</" + TAGNAME + "\\s*[>]"
+const HTMLCOMMENT = "<!-->|<!--->|<!--[\\s\\S]*?-->"
+const PROCESSINGINSTRUCTION = "[<][?][\\s\\S]*?[?][>]"
+const DECLARATION = "<![A-Za-z]+[^>]*>"
+const CDATA = "<!\\[CDATA\\[[\\s\\S]*?\\]\\]>"
+const HTMLTAG = "(?:" + OPENTAG + "|" + CLOSETAG + "|" + HTMLCOMMENT + "|" + PROCESSINGINSTRUCTION + "|" + DECLARATION + "|" + CDATA + ")"
+const reHtmlTag = new RegExp(HTMLTAG, "y")
+
+const rePunctuation = /^[!"#$%&'()*+,\-./:;<=>?@[\]\\^_`{|}~\p{P}\p{S}]/u
+const reLinkTitle = new RegExp(
+  '(?:"(' +
+    ESCAPED_CHAR +
+    '|\\\\[^\\\\]|[^\\\\"\\x00])*"' +
+    "|'(" +
+    ESCAPED_CHAR +
+    "|\\\\[^\\\\]|[^\\\\'\\x00])*'" +
+    "|\\((" +
+    ESCAPED_CHAR +
+    "|\\\\[^\\\\]|[^\\\\()\\x00])*\\))",
+  "y",
+)
+const reLinkDestinationBraces = /(?:<(?:[^<>\n\\\x00]|\\.)*>)/y
+const reEscapable = new RegExp("^" + ESCAPABLE)
+const reEntityHere = new RegExp(ENTITY_PATTERN, "iy")
+const reTicks = /`+/g
+const reTicksHere = /`+/y
+const reEmailAutolink =
+  /<([a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*)>/y
+const reAutolink = /<[A-Za-z][A-Za-z0-9.+-]{1,31}:[^<>\x00-\x20]*>/iy
+const reSpnl = / *(?:\n *)?/y
+const reWhitespaceChar = /^[ \t\n\x0b\x0c\x0d]/
+const reUnicodeWhitespaceChar = /^\s/
+const reFinalSpace = / *$/
+const reInitialSpace = / */y
+const reSpaceAtEndOfLine = / *(?:\n|$)/y
+const reLinkLabel = /\[(?:[^\\[\]]|\\.){0,1000}\]/sy
+const reMainCore = /[^\n`[\]\\!<&*_'"]+/y
+const reMainGfm = /[^\n`[\]\\!<&*_'"~]+/y
+const reMainMath = /[^\n`[\]\\!<&*_'"$]+/y
+const reMainGfmMath = /[^\n`[\]\\!<&*_'"~$]+/y
+
+// OpenCode's marked math extension (packages/ui/src/context/marked-parser.tsx), verbatim
+const reInlineDollarMath =
+  /\$\$(?!\$)((?:\\.|[^\\\n])*?(?:\\.|[^\\\n$]))\$\$|\$(?=[^\s$])((?:\\.|[^\\\n$])*?(?:\\\S|[^\s\\$]))\$(?!\w)/y
+const reInlineParenMath = /\\\(((?:\\.|[^\\\n])*?)\\\)/y
 
 const FILE_PATH_RE =
   /^(?:\.{0,2}\/)?(?:[\w.@+-]+\/)+[\w.@+-]+\.[a-zA-Z0-9]{1,10}(?::\d+(?:-\d+)?)?$|^[A-Za-z0-9_.-]+\.(?:swift|ts|tsx|js|jsx|rs|py|go|md|json|yml|yaml|toml|sh|css|html)(?::\d+(?:-\d+)?)?$/
-
 const URL_RE = /^https?:\/\/[^\s<>()`"']+$/
 
-/**
- * Repairs incomplete inline markers at the tail of an actively streaming block
- * without touching closed spans or scanning settled blocks.
- */
-export function healStreamingInline(raw: string): string {
-  if (!raw) return raw
+type NodeType =
+  | "text"
+  | "softbreak"
+  | "linebreak"
+  | "code"
+  | "emph"
+  | "strong"
+  | "del"
+  | "link"
+  | "image"
+  | "html_inline"
+  | "math"
+  | "root"
 
-  // 1. Strip incomplete trailing link destination `[label](https://...` -> `label`
-  let text = raw
-  const lastOpenBracket = text.lastIndexOf("[")
+class INode {
+  type: NodeType
+  literal = ""
+  escaped = false
+  destination = ""
+  title = ""
+  delimiter: MathDelimiter = "dollar"
+  display = false
+  parent: INode | null = null
+  first: INode | null = null
+  last: INode | null = null
+  next: INode | null = null
+  prev: INode | null = null
 
-  if (lastOpenBracket >= 0 && (lastOpenBracket === 0 || text[lastOpenBracket - 1] !== "\\")) {
-    const after = text.slice(lastOpenBracket)
-    const midMatch = /^(!?)\[([^\]]+)\]\(([^)\n]*)$/.exec(after)
+  constructor(type: NodeType, literal = "") {
+    this.type = type
+    this.literal = literal
+  }
 
-    if (midMatch) {
-      text = text.slice(0, lastOpenBracket) + (midMatch[1] ? "" : midMatch[2]!)
+  appendChild(child: INode) {
+    child.unlink()
+    child.parent = this
+    if (this.last) {
+      this.last.next = child
+      child.prev = this.last
+      this.last = child
+    } else {
+      this.first = child
+      this.last = child
     }
   }
 
-  // 2. Scan active backticks, math spans, bold, italic, and strikethrough
-  let inCodeTicks = 0
-  let boldAsterisk = false
-  let emAsterisk = false
-  let strikeTilde = false
-  let wordHadEm = false
+  insertAfter(sibling: INode) {
+    sibling.unlink()
+    sibling.next = this.next
+    if (sibling.next) sibling.next.prev = sibling
+    sibling.prev = this
+    this.next = sibling
+    sibling.parent = this.parent
+    if (sibling.parent && !sibling.next) sibling.parent.last = sibling
+  }
 
-  const n = text.length
-  let i = 0
+  insertBefore(sibling: INode) {
+    sibling.unlink()
+    sibling.prev = this.prev
+    if (sibling.prev) sibling.prev.next = sibling
+    sibling.next = this
+    this.prev = sibling
+    sibling.parent = this.parent
+    if (sibling.parent && !sibling.prev) sibling.parent.first = sibling
+  }
 
-  while (i < n) {
-    const ch = text.charCodeAt(i)
+  unlink() {
+    if (this.prev) this.prev.next = this.next
+    else if (this.parent) this.parent.first = this.next
+    if (this.next) this.next.prev = this.prev
+    else if (this.parent) this.parent.last = this.prev
+    this.parent = null
+    this.next = null
+    this.prev = null
+  }
+}
 
-    if (ch === 0x5c /* \ */) {
-      if (inCodeTicks === 0 && i + 1 < n) {
-        const nextEsc = text.charCodeAt(i + 1)
+interface Delimiter {
+  cc: number
+  numdelims: number
+  origdelims: number
+  node: INode
+  previous: Delimiter | null
+  next: Delimiter | null
+  canOpen: boolean
+  canClose: boolean
+}
 
-        if (nextEsc === 0x28 /* ( */) {
-          const closeMath = text.indexOf("\\)", i + 2)
+interface Bracket {
+  node: INode
+  previous: Bracket | null
+  previousDelimiter: Delimiter | null
+  index: number
+  image: boolean
+  active: boolean
+  bracketAfter: boolean
+}
 
-          if (closeMath > i + 2) {
-            i = closeMath + 2
-            continue
-          }
-        } else if (nextEsc === 0x5b /* [ */) {
-          const closeMath = text.indexOf("\\]", i + 2)
+const text = (s: string) => new INode("text", s)
 
-          if (closeMath > i + 2) {
-            i = closeMath + 2
-            continue
-          }
+/** Normalize a link label: strip brackets, trim, collapse whitespace, Unicode case fold */
+export function normalizeReference(label: string): string {
+  return label
+    .slice(1, label.length - 1)
+    .trim()
+    .replace(/[ \t\r\n]+/g, " ")
+    .toLowerCase()
+    .toUpperCase()
+}
+
+function isSpecialFastPath(src: string, gfm: boolean, math: boolean): boolean {
+  for (let i = 0; i < src.length; i++) {
+    const c = src.charCodeAt(i)
+    if (
+      c === C_NEWLINE ||
+      c === C_BACKSLASH ||
+      c === C_BACKTICK ||
+      c === C_ASTERISK ||
+      c === C_UNDERSCORE ||
+      c === C_OPEN_BRACKET ||
+      c === C_CLOSE_BRACKET ||
+      c === C_BANG ||
+      c === C_LESSTHAN ||
+      c === C_AMPERSAND ||
+      (gfm && (c === C_TILDE || c === C_COLON || c === 0x40 /* @ */ || c === 0x2e /* . */)) ||
+      (math && c === C_DOLLAR)
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
+class InlineParser {
+  subject = ""
+  pos = 0
+  delimiters: Delimiter | null = null
+  brackets: Bracket | null = null
+  refmap: ReadonlyMap<string, ReferenceDef> = new Map()
+  gfm = false
+  math = false
+  reMain = reMainCore
+  onUnresolvedRef?: (label: string) => void
+  onUsedRef?: (label: string) => void
+
+  /** `re` must be sticky (anchored at `pos`) or global (searching forward from `pos`) */
+  match(re: RegExp): string | null {
+    re.lastIndex = this.pos
+    const m = re.exec(this.subject)
+    if (m === null) return null
+    this.pos = re.lastIndex
+    return m[0]
+  }
+
+  peek(): number {
+    return this.pos < this.subject.length ? this.subject.charCodeAt(this.pos) : -1
+  }
+
+  spnl(): true {
+    this.match(reSpnl)
+    return true
+  }
+
+  parseBackticks(block: INode): boolean {
+    const ticks = this.match(reTicksHere)
+    if (ticks === null) return false
+    const afterOpenTicks = this.pos
+    let matched: string | null
+    while ((matched = this.match(reTicks)) !== null) {
+      if (matched === ticks) {
+        const node = new INode("code")
+        const contents = this.subject.slice(afterOpenTicks, this.pos - ticks.length).replace(/\n/gm, " ")
+        if (contents.length > 0 && /[^ ]/.test(contents) && contents[0] === " " && contents[contents.length - 1] === " ") {
+          node.literal = contents.slice(1, contents.length - 1)
+        } else {
+          node.literal = contents
         }
+        block.appendChild(node)
+        return true
       }
-
-      i += 2
-      continue
     }
+    this.pos = afterOpenTicks
+    block.appendChild(text(ticks))
+    return true
+  }
 
-    if (ch === 0x60 /* ` */) {
-      let run = 1
-      while (i + run < n && text.charCodeAt(i + run) === 0x60) run++
-
-      if (inCodeTicks === 0) {
-        inCodeTicks = run
-      } else if (inCodeTicks === run) {
-        inCodeTicks = 0
+  parseBackslash(block: INode): boolean {
+    const subj = this.subject
+    if (this.math) {
+      reInlineParenMath.lastIndex = this.pos
+      const m = reInlineParenMath.exec(subj)
+      if (m) {
+        const node = new INode("math", m[1]!.trim())
+        node.delimiter = "paren"
+        node.display = false
+        block.appendChild(node)
+        this.pos += m[0].length
+        return true
       }
-
-      i += run
-      continue
     }
-
-    if (inCodeTicks > 0) {
-      i++
-      continue
+    this.pos += 1
+    if (this.peek() === C_NEWLINE) {
+      this.pos += 1
+      block.appendChild(new INode("linebreak"))
+    } else if (reEscapable.test(subj.charAt(this.pos))) {
+      const node = text(subj.charAt(this.pos))
+      node.escaped = true
+      block.appendChild(node)
+      this.pos += 1
+    } else {
+      block.appendChild(text("\\"))
     }
+    return true
+  }
 
-    if (isWhitespace(ch)) {
-      wordHadEm = false
-      i++
-      continue
+  parseDollar(block: INode): boolean {
+    reInlineDollarMath.lastIndex = this.pos
+    const m = reInlineDollarMath.exec(this.subject)
+    if (!m) return false
+    const display = m[1] !== undefined
+    const node = new INode("math", (m[1] ?? m[2])!.trim())
+    node.delimiter = display ? "double-dollar" : "dollar"
+    node.display = display
+    block.appendChild(node)
+    this.pos += m[0].length
+    return true
+  }
+
+  parseAutolink(block: INode): boolean {
+    let m: string | null
+    if ((m = this.match(reEmailAutolink))) {
+      const dest = m.slice(1, m.length - 1)
+      const node = new INode("link")
+      node.destination = normalizeURI("mailto:" + dest)
+      node.appendChild(text(dest))
+      block.appendChild(node)
+      return true
     }
+    if ((m = this.match(reAutolink))) {
+      const dest = m.slice(1, m.length - 1)
+      const node = new INode("link")
+      node.destination = normalizeURI(dest)
+      node.appendChild(text(dest))
+      block.appendChild(node)
+      return true
+    }
+    return false
+  }
 
-    if (ch === 0x24 /* $ */) {
-      if (i + 1 < n && text.charCodeAt(i + 1) === 0x24) {
-        const close = findClosingDoubleDollar(text, i + 2)
+  parseHtmlTag(block: INode): boolean {
+    const m = this.match(reHtmlTag)
+    if (m === null) return false
+    block.appendChild(new INode("html_inline", m))
+    return true
+  }
 
-        if (close > i + 2) {
-          i = close + 2
-          continue
-        }
+  scanDelims(cc: number): { numdelims: number; canOpen: boolean; canClose: boolean } | null {
+    let numdelims = 0
+    const startpos = this.pos
+    while (this.peek() === cc) {
+      numdelims++
+      this.pos++
+    }
+    if (numdelims === 0) return null
 
-        i += 2
+    const charBefore = startpos === 0 ? "\n" : this.subject.charAt(startpos - 1)
+    const ccAfter = this.peek()
+    const charAfter = ccAfter === -1 ? "\n" : this.subject.charAt(this.pos)
+
+    const afterIsWhitespace = reUnicodeWhitespaceChar.test(charAfter)
+    const afterIsPunctuation = rePunctuation.test(charAfter)
+    const beforeIsWhitespace = reUnicodeWhitespaceChar.test(charBefore)
+    const beforeIsPunctuation = rePunctuation.test(charBefore)
+
+    const leftFlanking =
+      (!afterIsWhitespace && (!afterIsPunctuation || beforeIsWhitespace || beforeIsPunctuation)) ||
+      (this.gfm && cc !== C_TILDE && charAfter === "~")
+    const rightFlanking =
+      (!beforeIsWhitespace && (!beforeIsPunctuation || afterIsWhitespace || afterIsPunctuation)) ||
+      (this.gfm && cc !== C_TILDE && charBefore === "~")
+    let canOpen: boolean
+    let canClose: boolean
+    if (cc === C_UNDERSCORE) {
+      canOpen = leftFlanking && (!rightFlanking || beforeIsPunctuation)
+      canClose = rightFlanking && (!leftFlanking || afterIsPunctuation)
+    } else {
+      canOpen = leftFlanking
+      canClose = rightFlanking
+    }
+    if (cc === C_TILDE && numdelims > 2) {
+      canOpen = false
+      canClose = false
+    }
+    this.pos = startpos
+    return { numdelims, canOpen, canClose }
+  }
+
+  charBefore(pos: number): string {
+    const code = this.subject.charCodeAt(pos - 1)
+    if (code >= 0xdc00 && code <= 0xdfff && pos >= 2) {
+      const high = this.subject.charCodeAt(pos - 2)
+      if (high >= 0xd800 && high <= 0xdbff) return this.subject.slice(pos - 2, pos)
+    }
+    return this.subject.charAt(pos - 1)
+  }
+
+  handleDelim(cc: number, block: INode): boolean {
+    const res = this.scanDelims(cc)
+    if (!res) return false
+    const numdelims = res.numdelims
+    const startpos = this.pos
+    this.pos += numdelims
+    const node = text(this.subject.slice(startpos, this.pos))
+    block.appendChild(node)
+
+    if (res.canOpen || res.canClose) {
+      this.delimiters = {
+        cc,
+        numdelims,
+        origdelims: numdelims,
+        node,
+        previous: this.delimiters,
+        next: null,
+        canOpen: res.canOpen,
+        canClose: res.canClose,
+      }
+      if (this.delimiters.previous !== null) this.delimiters.previous.next = this.delimiters
+    }
+    return true
+  }
+
+  removeDelimiter(delim: Delimiter) {
+    if (delim.previous !== null) delim.previous.next = delim.next
+    if (delim.next === null) this.delimiters = delim.previous
+    else delim.next.previous = delim.previous
+  }
+
+  processEmphasis(stackBottom: Delimiter | null) {
+    const openersBottom: (Delimiter | null)[] = []
+    for (let i = 0; i < 16; i++) openersBottom[i] = stackBottom
+
+    let closer = this.delimiters
+    while (closer !== null && closer.previous !== stackBottom) closer = closer.previous
+
+    while (closer !== null) {
+      const closercc = closer.cc
+      if (!closer.canClose) {
+        closer = closer.next
         continue
       }
-
-      const close = findClosingDollar(text, i + 1)
-
-      if (close > i + 1) {
-        i = close + 1
-        continue
-      }
-
-      i++
-      continue
-    }
-
-    if (ch === 0x2a /* * */) {
-      let run = 1
-      while (i + run < n && text.charCodeAt(i + run) === 0x2a) run++
-
-      if (run >= 3) {
-        boldAsterisk = !boldAsterisk
-        emAsterisk = !emAsterisk
-        wordHadEm = true
-      } else if (run === 2) {
-        boldAsterisk = !boldAsterisk
-        wordHadEm = true
-      } else {
-        const prev = i > 0 ? text.charCodeAt(i - 1) : 0x20
-        const next = i + 1 < n ? text.charCodeAt(i + 1) : 0
-
-        if (!emAsterisk) {
-          if (next !== 0x20 && next !== 0x09 && next !== 0x0a && next !== 0 && (!isWordChar(prev) || wordHadEm)) {
-            emAsterisk = true
-            wordHadEm = true
+      let opener = closer.previous
+      let openerFound = false
+      const openersBottomIndex =
+        closercc === C_UNDERSCORE
+          ? 2 + (closer.canOpen ? 3 : 0) + (closer.origdelims % 3)
+          : closercc === C_ASTERISK
+            ? 8 + (closer.canOpen ? 3 : 0) + (closer.origdelims % 3)
+            : 14 + (closer.origdelims === 2 ? 1 : 0)
+      while (opener !== null && opener !== stackBottom && opener !== openersBottom[openersBottomIndex]) {
+        if (closercc === C_TILDE) {
+          if (opener.cc === C_TILDE && opener.canOpen && opener.origdelims === closer.origdelims) {
+            openerFound = true
+            break
           }
         } else {
-          if (prev !== 0x20 && prev !== 0x09 && prev !== 0x0a) {
-            emAsterisk = false
+          const oddMatch =
+            (closer.canOpen || opener.canClose) &&
+            closer.origdelims % 3 !== 0 &&
+            (opener.origdelims + closer.origdelims) % 3 === 0
+          if (opener.cc === closer.cc && opener.canOpen && !oddMatch) {
+            openerFound = true
+            break
           }
         }
+        opener = opener.previous
       }
+      const oldCloser = closer
 
-      i += run
-      continue
+      if (!openerFound) {
+        closer = closer.next
+      } else {
+        const op = opener!
+        const useDelims = closercc === C_TILDE ? closer.numdelims : closer.numdelims >= 2 && op.numdelims >= 2 ? 2 : 1
+        const openerInl = op.node
+        const closerInl = closer.node
+        op.numdelims -= useDelims
+        closer.numdelims -= useDelims
+        openerInl.literal = openerInl.literal.slice(0, openerInl.literal.length - useDelims)
+        closerInl.literal = closerInl.literal.slice(0, closerInl.literal.length - useDelims)
+
+        const emph = new INode(closercc === C_TILDE ? "del" : useDelims === 1 ? "emph" : "strong")
+        let tmp = openerInl.next
+        while (tmp && tmp !== closerInl) {
+          const next = tmp.next
+          tmp.unlink()
+          emph.appendChild(tmp)
+          tmp = next
+        }
+        openerInl.insertAfter(emph)
+
+        // remove delimiters between opener and closer
+        if (op.next !== closer) {
+          op.next = closer
+          closer.previous = op
+        }
+
+        if (op.numdelims === 0) {
+          openerInl.unlink()
+          this.removeDelimiter(op)
+        }
+        if (closer.numdelims === 0) {
+          closerInl.unlink()
+          const tempstack = closer.next
+          this.removeDelimiter(closer)
+          closer = tempstack
+        }
+      }
+      if (!openerFound) {
+        openersBottom[openersBottomIndex] = oldCloser.previous
+        if (!oldCloser.canOpen) this.removeDelimiter(oldCloser)
+      }
     }
 
-    if (ch === 0x7e /* ~ */ && i + 1 < n && text.charCodeAt(i + 1) === 0x7e) {
-      strikeTilde = !strikeTilde
-      i += 2
-      continue
+    while (this.delimiters !== null && this.delimiters !== stackBottom) this.removeDelimiter(this.delimiters)
+  }
+
+  parseLinkTitle(): string | null {
+    const title = this.match(reLinkTitle)
+    if (title === null) return null
+    return unescapeString(title.slice(1, -1))
+  }
+
+  parseLinkDestination(): string | null {
+    let res = this.match(reLinkDestinationBraces)
+    if (res !== null) return normalizeURI(unescapeString(res.slice(1, -1)))
+    if (this.peek() === C_LESSTHAN) return null
+    const savepos = this.pos
+    let openparens = 0
+    let c: number
+    while ((c = this.peek()) !== -1) {
+      if (c === C_BACKSLASH && reEscapable.test(this.subject.charAt(this.pos + 1))) {
+        this.pos += 1
+        if (this.peek() !== -1) this.pos += 1
+      } else if (c === C_OPEN_PAREN) {
+        this.pos += 1
+        openparens += 1
+      } else if (c === C_CLOSE_PAREN) {
+        if (openparens < 1) break
+        this.pos += 1
+        openparens -= 1
+      } else if (reWhitespaceChar.test(String.fromCharCode(c))) {
+        break
+      } else if (c < 0x20 || c === 0x7f) {
+        break
+      } else {
+        this.pos += 1
+      }
     }
-
-    i++
+    if (this.pos === savepos && c !== C_CLOSE_PAREN) return null
+    if (openparens !== 0) return null
+    res = this.subject.slice(savepos, this.pos)
+    return normalizeURI(unescapeString(res))
   }
 
-  let suffix = ""
-
-  if (inCodeTicks > 0) {
-    suffix += "`".repeat(inCodeTicks)
-  } else {
-    if (strikeTilde) suffix += "~~"
-    if (emAsterisk) suffix += "*"
-    if (boldAsterisk) suffix += "**"
+  parseLinkLabel(): number {
+    const m = this.match(reLinkLabel)
+    if (m === null || m.length > 1001) return 0
+    return m.length
   }
 
-  return suffix ? text + suffix : text
-}
+  parseOpenBracket(block: INode): boolean {
+    const startpos = this.pos
+    this.pos += 1
+    const node = text("[")
+    block.appendChild(node)
+    this.addBracket(node, startpos, false)
+    return true
+  }
 
-function isWordChar(code: number): boolean {
-  return (
-    (code >= 0x30 && code <= 0x39) ||
-    (code >= 0x41 && code <= 0x5a) ||
-    (code >= 0x61 && code <= 0x7a) ||
-    code === 0x5f
-  )
-}
-
-function isWhitespace(code: number): boolean {
-  return code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0d
-}
-
-function findClosingCodeTicks(src: string, from: number, count: number): number {
-  const n = src.length
-  let i = from
-
-  while (i < n) {
-    if (src.charCodeAt(i) === 0x60) {
-      let run = 1
-      while (i + run < n && src.charCodeAt(i + run) === 0x60) run++
-
-      if (run === count) return i
-      i += run
+  parseBang(block: INode): boolean {
+    const startpos = this.pos
+    this.pos += 1
+    if (this.peek() === C_OPEN_BRACKET) {
+      this.pos += 1
+      const node = text("![")
+      block.appendChild(node)
+      this.addBracket(node, startpos + 1, true)
     } else {
-      i++
+      block.appendChild(text("!"))
+    }
+    return true
+  }
+
+  lookupRef(label: string): ReferenceDef | undefined {
+    const norm = normalizeReference(label)
+    const def = this.refmap.get(norm)
+    if (def) this.onUsedRef?.(norm)
+    else if (norm) this.onUnresolvedRef?.(norm)
+    return def
+  }
+
+  parseCloseBracket(block: INode): boolean {
+    let dest: string | null = null
+    let title: string | null = null
+    let matched = false
+
+    this.pos += 1
+    const startpos = this.pos
+    let opener = this.brackets
+    if (opener === null) {
+      block.appendChild(text("]"))
+      return true
+    }
+    if (!opener.active) {
+      block.appendChild(text("]"))
+      this.removeBracket()
+      return true
+    }
+    const isImage = opener.image
+    const savepos = this.pos
+
+    if (this.peek() === C_OPEN_PAREN) {
+      this.pos++
+      if (
+        this.spnl() &&
+        (dest = this.parseLinkDestination()) !== null &&
+        this.spnl() &&
+        ((reWhitespaceChar.test(this.subject.charAt(this.pos - 1)) && (title = this.parseLinkTitle())) || true) &&
+        this.spnl() &&
+        this.peek() === C_CLOSE_PAREN
+      ) {
+        this.pos += 1
+        matched = true
+      } else {
+        this.pos = savepos
+      }
+    }
+
+    if (!matched) {
+      const beforelabel = this.pos
+      const n = this.parseLinkLabel()
+      let reflabel: string | undefined
+      if (n > 2) {
+        reflabel = this.subject.slice(beforelabel, beforelabel + n)
+      } else if (!opener.bracketAfter) {
+        reflabel = this.subject.slice(opener.index, startpos)
+      }
+      if (n === 0) this.pos = savepos
+      if (reflabel) {
+        const link = this.lookupRef(reflabel)
+        if (link) {
+          dest = link.href
+          title = link.title ?? null
+          matched = true
+        }
+      }
+    }
+
+    if (matched) {
+      const node = new INode(isImage ? "image" : "link")
+      node.destination = dest ?? ""
+      node.title = title || ""
+      let tmp = opener.node.next
+      while (tmp) {
+        const next = tmp.next
+        tmp.unlink()
+        node.appendChild(tmp)
+        tmp = next
+      }
+      block.appendChild(node)
+      this.processEmphasis(opener.previousDelimiter)
+      this.removeBracket()
+      opener.node.unlink()
+      if (!isImage) {
+        opener = this.brackets
+        while (opener !== null) {
+          if (!opener.image) opener.active = false
+          opener = opener.previous
+        }
+      }
+      return true
+    }
+
+    this.removeBracket()
+    this.pos = startpos
+    block.appendChild(text("]"))
+    return true
+  }
+
+  addBracket(node: INode, index: number, image: boolean) {
+    if (this.brackets !== null) this.brackets.bracketAfter = true
+    this.brackets = {
+      node,
+      previous: this.brackets,
+      previousDelimiter: this.delimiters,
+      index,
+      image,
+      active: true,
+      bracketAfter: false,
     }
   }
 
-  return -1
+  removeBracket() {
+    this.brackets = this.brackets!.previous
+  }
+
+  parseEntity(block: INode): boolean {
+    const m = this.match(reEntityHere)
+    if (!m) return false
+    const node = text(decodeEntity(m))
+    node.escaped = true
+    block.appendChild(node)
+    return true
+  }
+
+  parseString(block: INode): boolean {
+    const m = this.match(this.reMain)
+    if (!m) return false
+    block.appendChild(text(m))
+    return true
+  }
+
+  parseNewline(block: INode): boolean {
+    this.pos += 1
+    const lastc = block.last
+    if (lastc && lastc.type === "text" && lastc.literal[lastc.literal.length - 1] === " ") {
+      const hardbreak = lastc.literal[lastc.literal.length - 2] === " "
+      lastc.literal = lastc.literal.replace(reFinalSpace, "")
+      block.appendChild(new INode(hardbreak ? "linebreak" : "softbreak"))
+    } else {
+      block.appendChild(new INode("softbreak"))
+    }
+    this.match(reInitialSpace)
+    return true
+  }
+
+  /** Attempt to parse a link reference definition at the start of `s`, adding it to `refmap`. Returns chars consumed. */
+  parseReference(s: string, refmap: RefMap): number {
+    this.subject = s
+    this.pos = 0
+    const startpos = 0
+    let title: string | null = null
+
+    const matchChars = this.parseLinkLabel()
+    if (matchChars === 0) return 0
+    const rawlabel = this.subject.slice(0, matchChars)
+
+    if (this.peek() === C_COLON) {
+      this.pos++
+    } else {
+      this.pos = startpos
+      return 0
+    }
+
+    this.spnl()
+    const dest = this.parseLinkDestination()
+    if (dest === null) {
+      this.pos = startpos
+      return 0
+    }
+
+    const beforetitle = this.pos
+    this.spnl()
+    if (this.pos !== beforetitle) title = this.parseLinkTitle()
+    if (title === null) this.pos = beforetitle
+
+    let atLineEnd = true
+    if (this.match(reSpaceAtEndOfLine) === null) {
+      if (title === null) {
+        atLineEnd = false
+      } else {
+        title = null
+        this.pos = beforetitle
+        atLineEnd = this.match(reSpaceAtEndOfLine) !== null
+      }
+    }
+    if (!atLineEnd) {
+      this.pos = startpos
+      return 0
+    }
+
+    const normlabel = normalizeReference(rawlabel)
+    if (normlabel === "") {
+      this.pos = startpos
+      return 0
+    }
+    if (!refmap.has(normlabel)) {
+      refmap.set(normlabel, {
+        href: dest,
+        ...(title ? { title } : {}),
+        raw: s.slice(0, this.pos).trim(),
+      })
+    }
+    return this.pos - startpos
+  }
+
+  parseInline(block: INode): boolean {
+    const c = this.peek()
+    if (c === -1) return false
+    let res = false
+    switch (c) {
+      case C_NEWLINE:
+        res = this.parseNewline(block)
+        break
+      case C_BACKSLASH:
+        res = this.parseBackslash(block)
+        break
+      case C_BACKTICK:
+        res = this.parseBackticks(block)
+        break
+      case C_ASTERISK:
+      case C_UNDERSCORE:
+        res = this.handleDelim(c, block)
+        break
+      case C_TILDE:
+        res = this.gfm && this.handleDelim(c, block)
+        break
+      case C_DOLLAR:
+        res = this.math && this.parseDollar(block)
+        break
+      case C_OPEN_BRACKET:
+        res = this.parseOpenBracket(block)
+        break
+      case C_BANG:
+        res = this.parseBang(block)
+        break
+      case C_CLOSE_BRACKET:
+        res = this.parseCloseBracket(block)
+        break
+      case C_LESSTHAN:
+        res = this.parseAutolink(block) || this.parseHtmlTag(block)
+        break
+      case C_AMPERSAND:
+        res = this.parseEntity(block)
+        break
+      default:
+        res = this.parseString(block)
+        break
+    }
+    if (!res) {
+      this.pos += 1
+      block.appendChild(text(String.fromCharCode(c)))
+    }
+    return true
+  }
+
+  parse(content: string): INode {
+    const root = new INode("root")
+    this.subject = content.trim()
+    this.pos = 0
+    this.delimiters = null
+    this.brackets = null
+    while (this.parseInline(root)) {}
+    this.processEmphasis(null)
+    return root
+  }
 }
 
-function findClosingDollar(src: string, from: number): number {
-  const n = src.length
+const sharedParser = new InlineParser()
 
-  if (from >= n) return -1
-  const first = src.charCodeAt(from)
-
-  if (isWhitespace(first) || first === 0x24 /* $ */) return -1
-
-  let i = from
-
-  while (i < n) {
-    const c = src.charCodeAt(i)
-
-    if (c === 0x5c /* \ */) {
-      i += 2
-      continue
-    }
-
-    if (c === 0x0a || c === 0x0d) return -1
-
-    if (c === 0x24 /* $ */) {
-      const prev = src.charCodeAt(i - 1)
-
-      if (isWhitespace(prev)) return -1
-      const next = i + 1 < n ? src.charCodeAt(i + 1) : 0
-
-      // Pandoc currency rule: closing $ cannot be followed by alphanumeric/digit/underscore
-      if (isWordChar(next)) return -1
-
-      return i
-    }
-
-    i++
-  }
-
-  return -1
-}
-
-function findClosingDoubleDollar(src: string, from: number): number {
-  const n = src.length
-  let i = from
-
-  while (i + 1 < n) {
-    const c = src.charCodeAt(i)
-
-    if (c === 0x5c /* \ */) {
-      i += 2
-      continue
-    }
-
-    if (c === 0x24 && src.charCodeAt(i + 1) === 0x24) {
-      return i
-    }
-
-    i++
-  }
-
-  return -1
+/** Parse a link reference definition at the start of `s` into `refmap`; returns the number of characters consumed */
+export function parseReference(s: string, refmap: RefMap): number {
+  return sharedParser.parseReference(s, refmap)
 }
 
 export function parseInlines(raw: string, options: InlineParseOptions = {}): InlineNode[] {
-  const src = options.streaming && options.heal !== false ? healStreamingInline(raw) : raw
-
+  const gfm = options.gfm !== false
+  const math = options.math !== false
+  const src = raw.trim()
   if (!src) return []
+  if (!isSpecialFastPath(src, gfm, math)) return [{ type: "text", text: src }]
 
-  // Fast path for plain ASCII/Unicode text with zero inline punctuation triggers
-  let hasSpecial = false
+  const p = sharedParser
+  p.refmap = options.defs ?? new Map()
+  p.gfm = gfm
+  p.math = math
+  p.reMain = gfm ? (math ? reMainGfmMath : reMainGfm) : math ? reMainMath : reMainCore
+  p.onUnresolvedRef = options.onUnresolvedRef
+  p.onUsedRef = options.onUsedRef
+  const root = p.parse(src)
+  return convertChildren(root, gfm, false)
+}
 
-  for (let i = 0; i < src.length; i++) {
-    const c = src.charCodeAt(i)
+function convertChildren(parent: INode, gfm: boolean, inLink: boolean): InlineNode[] {
+  const out: InlineNode[] = []
+  let pendingText = ""
+  let prevChar = ""
+  const pushText = (s: string) => {
+    if (!s) return
+    const prev = out[out.length - 1]
+    if (prev && prev.type === "text") prev.text += s
+    else out.push({ type: "text", text: s })
+  }
+  const flush = () => {
+    if (!pendingText) return
+    if (gfm && !inLink) {
+      for (const node of autolinkLiterals(pendingText, prevChar)) {
+        if (node.type === "text") pushText(node.text)
+        else out.push(node)
+      }
+    } else {
+      pushText(pendingText)
+    }
+    prevChar = pendingText[pendingText.length - 1]!
+    pendingText = ""
+  }
+  for (let n = parent.first; n; n = n.next) {
+    switch (n.type) {
+      case "text":
+        if (gfm && !inLink && n.escaped) {
+          flush()
+          pushText(n.literal)
+          prevChar = n.literal[n.literal.length - 1] ?? ""
+        } else {
+          pendingText += n.literal
+        }
+        break
+      case "softbreak":
+        pendingText += "\n"
+        break
+      case "linebreak":
+        flush()
+        out.push({ type: "br" })
+        prevChar = "\n"
+        break
+      case "code": {
+        flush()
+        const isUrl = URL_RE.test(n.literal)
+        const isFilePath = !isUrl && FILE_PATH_RE.test(n.literal)
+        out.push({
+          type: "code",
+          text: n.literal,
+          ...(isUrl ? { isUrl: true } : {}),
+          ...(isFilePath ? { isFilePath: true } : {}),
+        })
+        prevChar = "`"
+        break
+      }
+      case "emph":
+        flush()
+        out.push({ type: "em", children: convertChildren(n, gfm, inLink) })
+        prevChar = "*"
+        break
+      case "strong":
+        flush()
+        out.push({ type: "strong", children: convertChildren(n, gfm, inLink) })
+        prevChar = "*"
+        break
+      case "del":
+        flush()
+        out.push({ type: "del", children: convertChildren(n, gfm, inLink) })
+        prevChar = "~"
+        break
+      case "link":
+        flush()
+        out.push({
+          type: "link",
+          href: n.destination,
+          ...(n.title ? { title: n.title } : {}),
+          children: convertChildren(n, gfm, true),
+        })
+        prevChar = ")"
+        break
+      case "image": {
+        flush()
+        const children = convertChildren(n, gfm, true)
+        out.push({
+          type: "image",
+          src: n.destination,
+          alt: inlinePlainText(children),
+          ...(n.title ? { title: n.title } : {}),
+          children,
+        })
+        prevChar = ")"
+        break
+      }
+      case "html_inline":
+        flush()
+        out.push({ type: "html_inline", raw: n.literal })
+        prevChar = ">"
+        break
+      case "math":
+        flush()
+        out.push({ type: "math", source: n.literal, delimiter: n.delimiter, display: n.display })
+        prevChar = "$"
+        break
+    }
+  }
+  flush()
+  return out
+}
 
-    if (
-      c === 0x60 /* ` */ ||
-      c === 0x2a /* * */ ||
-      c === 0x5f /* _ */ ||
-      c === 0x7e /* ~ */ ||
-      c === 0x5b /* [ */ ||
-      c === 0x21 /* ! */ ||
-      c === 0x24 /* $ */ ||
-      c === 0x5c /* \ */ ||
-      c === 0x3c /* < */ ||
-      c === 0x0a /* \n */ ||
-      (c === 0x68 /* h */ && src.startsWith("http", i))
-    ) {
-      hasSpecial = true
+function inlinePlainText(nodes: ReadonlyArray<InlineNode>): string {
+  let out = ""
+  for (const node of nodes) {
+    switch (node.type) {
+      case "text":
+      case "code":
+        out += node.text
+        break
+      case "strong":
+      case "em":
+      case "del":
+      case "link":
+        out += inlinePlainText(node.children)
+        break
+      case "image":
+        out += node.children ? inlinePlainText(node.children) : node.alt
+        break
+      case "math":
+        out += node.source
+        break
+      case "br":
+        out += "\n"
+        break
+      case "html_inline":
+        out += node.raw
+        break
+    }
+  }
+  return out
+}
+
+// GFM extended autolinks (www., http://, https://, ftp://, and bare emails), applied to merged text runs
+// outside links, following cmark-gfm's autolink extension.
+
+function isAlnum(c: number): boolean {
+  return (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a)
+}
+
+function isAutolinkWhitespace(c: number): boolean {
+  return c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0b || c === 0x0c || c === 0x0d
+}
+
+function isValidPrecedingForWww(s: string, i: number, prevChar: string): boolean {
+  if (i === 0 && !prevChar) return true
+  const c = i === 0 ? prevChar.charCodeAt(0) : s.charCodeAt(i - 1)
+  return (
+    isAutolinkWhitespace(c) ||
+    c === C_ASTERISK ||
+    c === C_UNDERSCORE ||
+    c === C_TILDE ||
+    c === C_OPEN_PAREN ||
+    c === C_OPEN_BRACKET ||
+    c === C_CLOSE_BRACKET
+  )
+}
+
+/** Length of a valid domain at `i`, or 0. Mirrors cmark-gfm `check_domain`. */
+function checkDomain(s: string, i: number, allowShort: boolean): number {
+  let np = 0
+  let uscore1 = 0
+  let uscore2 = 0
+  let j = i
+  for (; j < s.length; j++) {
+    const c = s.charCodeAt(j)
+    if (c === 0x5c /* \ */ && j + 1 < s.length) {
+      // a backslash is never part of a domain
+      break
+    }
+    if (c === C_UNDERSCORE) {
+      uscore2++
+    } else if (c === 0x2e /* . */) {
+      uscore1 = uscore2
+      uscore2 = 0
+      np++
+    } else if (!isAlnum(c) && c !== 0x2d /* - */ && c < 0x80) {
       break
     }
   }
-
-  if (!hasSpecial) {
-    return [{ type: "text", text: src }]
-  }
-
-  return tokenizeInlineRange(src, options)
+  if ((uscore1 > 0 || uscore2 > 0) && np <= 10) return 0
+  if (allowShort || np > 0) return j - i
+  return 0
 }
 
-function appendText(nodes: InlineNode[], text: string) {
-  if (!text) return
-  const last = nodes[nodes.length - 1]
-
-  if (last && last.type === "text") {
-    last.text += text
-  } else {
-    nodes.push({ type: "text", text })
-  }
-}
-
-function tokenizeInlineRange(src: string, options: InlineParseOptions): InlineNode[] {
-  const nodes: InlineNode[] = []
-  const n = src.length
-  const mathEnabled = options.math !== false
-  const gfmEnabled = options.gfm !== false
-  let i = 0
-  let textStart = 0
-
-  const flushText = (end: number) => {
-    if (end > textStart) {
-      appendText(nodes, src.slice(textStart, end))
+/** Trim trailing punctuation from a candidate link of length `len` starting at `start`. Mirrors cmark-gfm `autolink_delim`. */
+function autolinkDelim(s: string, start: number, len: number): number {
+  for (let k = 0; k < len; k++) {
+    if (s.charCodeAt(start + k) === C_LESSTHAN) {
+      len = k
+      break
     }
   }
-
-  while (i < n) {
-    const c = src.charCodeAt(i)
-
-    // 1. Escape or `\( ... \)` inline math
-    if (c === 0x5c /* \ */ && i + 1 < n) {
-      const next = src.charCodeAt(i + 1)
-
-      if (mathEnabled && next === 0x28 /* ( */) {
-        const close = src.indexOf("\\)", i + 2)
-
-        if (close > i + 2) {
-          const mathText = src.slice(i + 2, close).trim()
-
-          if (mathText.length > 0) {
-            flushText(i)
-            nodes.push({ type: "math", source: mathText, delimiter: "paren", display: false })
-            i = close + 2
-            textStart = i
-            continue
-          }
-        }
+  while (len > 0) {
+    const cclose = s.charCodeAt(start + len - 1)
+    if (cclose === C_CLOSE_PAREN) {
+      let opening = 0
+      let closing = 0
+      for (let k = 0; k < len; k++) {
+        const c = s.charCodeAt(start + k)
+        if (c === C_OPEN_PAREN) opening++
+        else if (c === C_CLOSE_PAREN) closing++
       }
-
-      if ("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~".includes(src[i + 1]!)) {
-        flushText(i)
-        appendText(nodes, src[i + 1]!)
-        i += 2
-        textStart = i
-        continue
-      }
-
-      i += 2
-      continue
-    }
-
-    // 2. Hard line break (`  \n`)
-    if (c === 0x0a /* \n */) {
-      if (i >= 2 && src.charCodeAt(i - 1) === 0x20 && src.charCodeAt(i - 2) === 0x20) {
-        flushText(i - 2)
-        nodes.push({ type: "br" })
-        i++
-        textStart = i
-        continue
-      }
-
-      i++
-      continue
-    }
-
-    // 3. Inline code span `` `...` ``
-    if (c === 0x60 /* ` */) {
-      let run = 1
-      while (i + run < n && src.charCodeAt(i + run) === 0x60) run++
-      const close = findClosingCodeTicks(src, i + run, run)
-
-      if (close >= 0) {
-        flushText(i)
-        let codeText = src.slice(i + run, close)
-
-        if (
-          codeText.length >= 2 &&
-          codeText.charCodeAt(0) === 0x20 &&
-          codeText.charCodeAt(codeText.length - 1) === 0x20 &&
-          codeText.trim().length > 0
-        ) {
-          codeText = codeText.slice(1, -1)
-        }
-
-        const isUrl = URL_RE.test(codeText)
-        const isFilePath = !isUrl && FILE_PATH_RE.test(codeText)
-        const codeNode: Extract<InlineNode, { type: "code" }> = {
-          type: "code",
-          text: codeText,
-        }
-
-        if (isUrl) codeNode.isUrl = true
-        if (isFilePath) codeNode.isFilePath = true
-        nodes.push(codeNode)
-        i = close + run
-        textStart = i
-        continue
-      }
-
-      i += run
-      continue
-    }
-
-    // 4. Inline math `$...$` or `$$...$$`
-    if (mathEnabled && c === 0x24 /* $ */) {
-      if (i + 1 < n && src.charCodeAt(i + 1) === 0x24) {
-        const close = findClosingDoubleDollar(src, i + 2)
-
-        if (close > i + 2) {
-          const mathText = src.slice(i + 2, close).trim()
-
-          if (mathText.length > 0) {
-            flushText(i)
-            nodes.push({ type: "math", source: mathText, delimiter: "double-dollar", display: true })
-            i = close + 2
-            textStart = i
-            continue
-          }
-        }
-
-        i += 2
-        continue
-      }
-
-      const close = findClosingDollar(src, i + 1)
-
-      if (close > i + 1) {
-        const mathText = src.slice(i + 1, close).trim()
-
-        if (mathText.length > 0) {
-          flushText(i)
-          nodes.push({ type: "math", source: mathText, delimiter: "dollar", display: false })
-          i = close + 1
-          textStart = i
-          continue
-        }
-      }
-
-      i++
-      continue
-    }
-
-    // 5. Image `![alt](src)` or Link `[label](href)` / `[label][id]`
-    if (c === 0x5b /* [ */ || (c === 0x21 /* ! */ && i + 1 < n && src.charCodeAt(i + 1) === 0x5b)) {
-      const isImage = c === 0x21
-      const labelStart = isImage ? i + 2 : i + 1
-      const labelEnd = findClosingBracket(src, labelStart)
-
-      if (labelEnd >= labelStart) {
-        const label = src.slice(labelStart, labelEnd)
-        const afterBracket = labelEnd + 1
-
-        // 5a. Inline link/image `(href "title")`
-        if (afterBracket < n && src.charCodeAt(afterBracket) === 0x28 /* ( */) {
-          const destEnd = findClosingParen(src, afterBracket + 1)
-
-          if (destEnd >= afterBracket + 1) {
-            flushText(i)
-            const rawDest = src.slice(afterBracket + 1, destEnd).trim()
-            const { href, title } = parseLinkDest(rawDest)
-
-            if (isImage) {
-              const imageNode: Extract<InlineNode, { type: "image" }> = { type: "image", alt: label, src: href }
-              if (title) imageNode.title = title
-              nodes.push(imageNode)
-            } else {
-              const linkNode: Extract<InlineNode, { type: "link" }> = {
-                type: "link",
-                href,
-                children: parseInlines(label, { ...options, streaming: false }),
-              }
-              if (title) linkNode.title = title
-              nodes.push(linkNode)
-            }
-
-            i = destEnd + 1
-            textStart = i
-            continue
-          }
-        }
-
-        // 5b. Reference link `[label][id]` or shortcut `[label]`
-        if (options.defs) {
-          let refId = label.toLowerCase()
-          let nextCursor = afterBracket
-
-          if (afterBracket < n && src.charCodeAt(afterBracket) === 0x5b /* [ */) {
-            const refClose = src.indexOf("]", afterBracket + 1)
-
-            if (refClose >= afterBracket + 1) {
-              const explicitRef = src.slice(afterBracket + 1, refClose).trim()
-              if (explicitRef) refId = explicitRef.toLowerCase()
-              nextCursor = refClose + 1
-            }
-          }
-
-          const def = options.defs.get(refId)
-
-          if (def) {
-            options.onUsedRef?.(refId)
-            flushText(i)
-
-            if (isImage) {
-              const imageNode: Extract<InlineNode, { type: "image" }> = { type: "image", alt: label, src: def.href }
-              if (def.title) imageNode.title = def.title
-              nodes.push(imageNode)
-            } else {
-              const linkNode: Extract<InlineNode, { type: "link" }> = {
-                type: "link",
-                href: def.href,
-                children: parseInlines(label, { ...options, streaming: false }),
-              }
-              if (def.title) linkNode.title = def.title
-              nodes.push(linkNode)
-            }
-
-            i = nextCursor
-            textStart = i
-            continue
-          } else {
-            options.onUnresolvedRef?.(refId)
-          }
-        }
-      }
-
-      i++
-      continue
-    }
-
-    // 6. Angle-bracket autolink `<https://...>`
-    if (c === 0x3c /* < */) {
-      const close = src.indexOf(">", i + 1)
-
-      if (close > i + 1) {
-        const inner = src.slice(i + 1, close)
-
-        if (/^https?:\/\/[^\s<>]+$/.test(inner)) {
-          flushText(i)
-          nodes.push({
-            type: "link",
-            href: inner,
-            children: [{ type: "text", text: inner }],
-          })
-          i = close + 1
-          textStart = i
-          continue
-        }
-      }
-
-      i++
-      continue
-    }
-
-    // 7. GFM bare URL autolink `https://...`
-    if (
-      gfmEnabled &&
-      c === 0x68 /* h */ &&
-      (src.startsWith("https://", i) || src.startsWith("http://", i)) &&
-      (i === 0 || isWhitespace(src.charCodeAt(i - 1)) || src.charCodeAt(i - 1) === 0x28)
+      if (closing <= opening) break
+      len--
+    } else if (
+      cclose === 0x3f /* ? */ ||
+      cclose === 0x21 /* ! */ ||
+      cclose === 0x2e /* . */ ||
+      cclose === 0x2c /* , */ ||
+      cclose === 0x3a /* : */ ||
+      cclose === C_ASTERISK ||
+      cclose === C_UNDERSCORE ||
+      cclose === C_TILDE ||
+      cclose === 0x27 /* ' */ ||
+      cclose === 0x22 /* " */
     ) {
-      let end = i
-
-      while (end < n && !isWhitespace(src.charCodeAt(end)) && !"<>[]\"'".includes(src[end]!)) {
-        end++
-      }
-
-      while (end > i && ".,!?;:)".includes(src[end - 1]!)) {
-        if (src[end - 1] === ")") {
-          const slice = src.slice(i, end - 1)
-          const opens = (slice.match(/\(/g) ?? []).length
-          const closes = (slice.match(/\)/g) ?? []).length
-
-          if (opens > closes) break
-        }
-
-        end--
-      }
-
-      if (end > i + 8) {
-        const url = src.slice(i, end)
-        flushText(i)
-        nodes.push({
-          type: "link",
-          href: url,
-          children: [{ type: "text", text: url }],
-        })
-        i = end
-        textStart = i
-        continue
-      }
+      len--
+    } else if (cclose === 0x3b /* ; */) {
+      let newEnd = len - 2
+      while (newEnd > 0 && isAlnum(s.charCodeAt(start + newEnd))) newEnd--
+      if (newEnd < len - 2 && s.charCodeAt(start + newEnd) === C_AMPERSAND) len = newEnd
+      else len--
+    } else {
+      break
     }
+  }
+  return len
+}
 
-    // 8. GFM Strikethrough `~~...~~`
-    if (gfmEnabled && c === 0x7e /* ~ */ && i + 1 < n && src.charCodeAt(i + 1) === 0x7e) {
-      const close = findClosingDelimiter(src, i + 2, "~~")
+function matchWww(s: string, i: number, prevChar: string): number {
+  if (!isValidPrecedingForWww(s, i, prevChar)) return 0
+  if (!s.startsWith("www.", i)) return 0
+  const domainLen = checkDomain(s, i, false)
+  if (domainLen === 0) return 0
+  let end = i + domainLen
+  while (end < s.length && !isAutolinkWhitespace(s.charCodeAt(end))) end++
+  return autolinkDelim(s, i, end - i)
+}
 
-      if (close > i + 2) {
-        flushText(i)
-        nodes.push({
-          type: "del",
-          children: tokenizeInlineRange(src.slice(i + 2, close), options),
-        })
-        i = close + 2
-        textStart = i
-        continue
-      }
+function matchUrl(s: string, i: number, prevChar: string): { len: number; schemeLen: number } | null {
+  // `i` points at ':' of "://"
+  if (!s.startsWith("://", i)) return null
+  let start = i
+  while (start > 0 && /[A-Za-z]/.test(s[start - 1]!)) start--
+  if (start === 0 && prevChar && /[A-Za-z]/.test(prevChar)) return null
+  const scheme = s.slice(start, i).toLowerCase()
+  const matchedScheme =
+    scheme === "https" || scheme === "http" || scheme === "ftp" ? scheme : ""
+  if (!matchedScheme) return null
+  const schemeStart = start
+  const domainLen = checkDomain(s, i + 3, true)
+  if (domainLen === 0) return null
+  let end = i + 3 + domainLen
+  while (end < s.length && !isAutolinkWhitespace(s.charCodeAt(end))) end++
+  const len = autolinkDelim(s, schemeStart, end - schemeStart)
+  if (len <= i + 3 - schemeStart) return null
+  return { len, schemeLen: i - schemeStart }
+}
 
-      i += 2
+function isEmailLocal(c: number): boolean {
+  return isAlnum(c) || c === 0x2e || c === 0x2b || c === 0x2d || c === C_UNDERSCORE
+}
+
+function matchEmail(s: string, at: number, minStart: number, prevChar: string): { start: number; end: number } | null {
+  let start = at
+  while (start > minStart && isEmailLocal(s.charCodeAt(start - 1))) start--
+  if (start === at) return null
+  if (start > 0) {
+    if (s.charCodeAt(start - 1) === 0x2f /* / */) return null
+  } else if (prevChar) {
+    const pc = prevChar.charCodeAt(0)
+    if (pc === 0x2f /* / */ || isEmailLocal(pc)) return null
+  }
+  let np = 0
+  let end = at + 1
+  for (; end < s.length; end++) {
+    const c = s.charCodeAt(end)
+    if (isAlnum(c)) continue
+    if (c === 0x40 /* @ */) return null
+    if (c === 0x2e && end + 1 < s.length && isAlnum(s.charCodeAt(end + 1))) {
+      np++
       continue
     }
+    if (c !== 0x2d && c !== C_UNDERSCORE) break
+  }
+  if (end - at < 2 || np === 0) return null
+  const last = s.charCodeAt(end - 1)
+  if (!((last >= 0x41 && last <= 0x5a) || (last >= 0x61 && last <= 0x7a))) return null
+  return { start, end }
+}
 
-    // 9. Strong / Emphasis (`*` or `_`)
-    if (c === 0x2a /* * */ || c === 0x5f /* _ */) {
-      const mark = src[i]!
-      let run = 1
-      while (i + run < n && src[i + run] === mark) run++
+const RE_AUTOLINK_CANDIDATE = /www\.|:\/\/|@/i
 
-      if (c === 0x5f) {
-        const prev = i > 0 ? src.charCodeAt(i - 1) : 0
-
-        if (isWordChar(prev)) {
-          i += run
+function autolinkLiterals(s: string, prevChar: string): InlineNode[] {
+  if (!RE_AUTOLINK_CANDIDATE.test(s)) return [{ type: "text", text: s }]
+  const out: InlineNode[] = []
+  let textStart = 0
+  let i = 0
+  const emit = (start: number, end: number, href: string) => {
+    if (start > textStart) out.push({ type: "text", text: s.slice(textStart, start) })
+    const label = s.slice(start, end)
+    out.push({ type: "link", href: normalizeURI(href), children: [{ type: "text", text: label }] })
+    textStart = end
+    i = end
+  }
+  while (i < s.length) {
+    const c = s.charCodeAt(i)
+    if ((c === 0x77 || c === 0x57) && s.startsWith("www.", i)) {
+      const len = matchWww(s, i, prevChar)
+      if (len > 0) {
+        emit(i, i + len, "http://" + s.slice(i, i + len))
+        continue
+      }
+    } else if (c === C_COLON) {
+      const m = matchUrl(s, i, prevChar)
+      if (m) {
+        const start = i - m.schemeLen
+        if (start >= textStart) {
+          emit(start, start + m.len, s.slice(start, start + m.len))
           continue
         }
       }
-
-      if (run >= 3) {
-        const delim = mark.repeat(3)
-        const close = findClosingDelimiter(src, i + 3, delim)
-
-        if (close > i + 3) {
-          flushText(i)
-          nodes.push({
-            type: "strong",
-            children: [
-              {
-                type: "em",
-                children: tokenizeInlineRange(src.slice(i + 3, close), options),
-              },
-            ],
-          })
-          i = close + 3
-          textStart = i
-          continue
-        }
-      }
-
-      if (run >= 2) {
-        const delim = mark.repeat(2)
-        const close = findClosingDelimiter(src, i + 2, delim)
-
-        if (close > i + 2 && !isWhitespace(src.charCodeAt(i + 2))) {
-          flushText(i)
-          nodes.push({
-            type: "strong",
-            children: tokenizeInlineRange(src.slice(i + 2, close), options),
-          })
-          i = close + 2
-          textStart = i
-          continue
-        }
-      }
-
-      if (run === 1) {
-        const nextChar = i + 1 < n ? src.charCodeAt(i + 1) : 0x20
-
-        if (!isWhitespace(nextChar)) {
-          const close = findSingleEmphasisClose(src, i + 1, c)
-
-          if (close > i + 1) {
-            flushText(i)
-            nodes.push({
-              type: "em",
-              children: tokenizeInlineRange(src.slice(i + 1, close), options),
-            })
-            i = close + 1
-            textStart = i
-            continue
-          }
-        }
-      }
-
-      i += run
-      continue
-    }
-
-    i++
-  }
-
-  flushText(n)
-
-  return nodes
-}
-
-function findClosingBracket(src: string, from: number): number {
-  const n = src.length
-  let depth = 1
-  let i = from
-
-  while (i < n) {
-    const c = src.charCodeAt(i)
-
-    if (c === 0x5c /* \ */) {
-      i += 2
-      continue
-    }
-
-    if (c === 0x60 /* ` */) {
-      let run = 1
-      while (i + run < n && src.charCodeAt(i + run) === 0x60) run++
-      const close = findClosingCodeTicks(src, i + run, run)
-
-      if (close >= 0) {
-        i = close + run
+    } else if (c === 0x40 /* @ */) {
+      const m = matchEmail(s, i, textStart, prevChar)
+      if (m) {
+        emit(m.start, m.end, "mailto:" + s.slice(m.start, m.end))
         continue
       }
-
-      i += run
-      continue
     }
-
-    if (c === 0x5b /* [ */) depth++
-    else if (c === 0x5d /* ] */) {
-      depth--
-
-      if (depth === 0) return i
-    }
-
     i++
   }
-
-  return -1
-}
-
-function findClosingParen(src: string, from: number): number {
-  const n = src.length
-  let depth = 1
-  let i = from
-
-  while (i < n) {
-    const c = src.charCodeAt(i)
-
-    if (c === 0x5c /* \ */) {
-      i += 2
-      continue
-    }
-
-    if (c === 0x0a || c === 0x0d) return -1
-
-    if (c === 0x28 /* ( */) depth++
-    else if (c === 0x29 /* ) */) {
-      depth--
-
-      if (depth === 0) return i
-    }
-
-    i++
-  }
-
-  return -1
-}
-
-function parseLinkDest(raw: string): { href: string; title?: string } {
-  if (raw.startsWith("<")) {
-    const close = raw.indexOf(">")
-
-    if (close > 0) {
-      const href = raw.slice(1, close)
-      const rest = raw.slice(close + 1).trim()
-      const title = rest.length >= 2 && (rest.startsWith('"') || rest.startsWith("'")) ? rest.slice(1, -1) : undefined
-
-      return { href, title }
-    }
-  }
-
-  const spaceIdx = raw.search(/\s/)
-
-  if (spaceIdx < 0) return { href: raw }
-  const href = raw.slice(0, spaceIdx)
-  const rest = raw.slice(spaceIdx).trim()
-  const title = rest.length >= 2 && (rest.startsWith('"') || rest.startsWith("'")) ? rest.slice(1, -1) : undefined
-
-  return { href, title }
-}
-
-function findClosingDelimiter(src: string, from: number, delim: string): number {
-  const n = src.length
-  const dLen = delim.length
-  const firstCode = delim.charCodeAt(0)
-  let i = from
-
-  while (i + dLen <= n) {
-    const c = src.charCodeAt(i)
-
-    if (c === 0x5c /* \ */) {
-      i += 2
-      continue
-    }
-
-    if (c === 0x60 /* ` */) {
-      let run = 1
-      while (i + run < n && src.charCodeAt(i + run) === 0x60) run++
-      const close = findClosingCodeTicks(src, i + run, run)
-
-      if (close >= 0) {
-        i = close + run
-        continue
-      }
-
-      i += run
-      continue
-    }
-
-    if (c === firstCode && src.startsWith(delim, i)) {
-      if (!isWhitespace(src.charCodeAt(i - 1))) {
-        return i
-      }
-    }
-
-    i++
-  }
-
-  return -1
-}
-
-function findSingleEmphasisClose(src: string, from: number, markCode: number): number {
-  const n = src.length
-  let i = from
-
-  while (i < n) {
-    const c = src.charCodeAt(i)
-
-    if (c === 0x5c /* \ */) {
-      i += 2
-      continue
-    }
-
-    if (c === 0x60 /* ` */) {
-      let run = 1
-      while (i + run < n && src.charCodeAt(i + run) === 0x60) run++
-      const close = findClosingCodeTicks(src, i + run, run)
-
-      if (close >= 0) {
-        i = close + run
-        continue
-      }
-
-      i += run
-      continue
-    }
-
-    if (c === markCode) {
-      let run = 1
-      while (i + run < n && src.charCodeAt(i + run) === markCode) run++
-
-      if (run === 1) {
-        const prev = src.charCodeAt(i - 1)
-        const next = i + 1 < n ? src.charCodeAt(i + 1) : 0
-
-        if (!isWhitespace(prev) && (markCode !== 0x5f || !isWordChar(next))) {
-          return i
-        }
-      }
-
-      i += run
-      continue
-    }
-
-    i++
-  }
-
-  return -1
+  if (textStart === 0) return [{ type: "text", text: s }]
+  if (textStart < s.length) out.push({ type: "text", text: s.slice(textStart) })
+  return out
 }

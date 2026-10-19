@@ -44,6 +44,7 @@ function toBlock(block: MarkdownBlock): Block {
     }
 
     const language = block.kind.type === "mermaid" ? "mermaid" : block.kind.language
+
     if (language) item.language = language
 
     if (block.kind.complete || block.status === "settled") item.complete = true
@@ -66,6 +67,7 @@ export function stream(text: string, live: boolean): Block[] {
   if (!live) return completedProjection(text).blocks
 
   const blocks = createStream().update(text, { streaming: true }).blocks.map(toBlock)
+
   if (blocks.length === 0) return [{ raw: text, src: text, mode: "live" }]
 
   return blocks
@@ -113,6 +115,7 @@ export function project(previous: Projection | undefined, text: string, live: bo
   if (!instance || instance.getText() !== previous.text) {
     // The worker lost this stream (or the projection came from elsewhere): replay it into a fresh parser.
     instance = createStream()
+
     if (previous.text.length > 0 && text.startsWith(previous.text)) {
       instance.update(previous.text, { streaming: true })
     }
@@ -123,12 +126,15 @@ export function project(previous: Projection | undefined, text: string, live: bo
 
   if (frame.blocks.length === 0) {
     const fallbackBlock: Block = { raw: text, src: text, mode: live ? "live" : "full" }
+
     const next: Projection = {
       text,
       blocks: [fallbackBlock],
       patches: [{ op: "truncate", keepCount: 0 }, { op: "append", block: fallbackBlock }],
     }
+
     if (live) streams.set(next, instance)
+
     return next
   }
 
@@ -136,13 +142,14 @@ export function project(previous: Projection | undefined, text: string, live: bo
     ? {
         blocks: frame.blocks.map(toBlock),
         patches: [
-          { op: "truncate", keepCount: 0 } as ProjectionPatch,
-          ...frame.blocks.map((block) => ({ op: "append", block: toBlock(block) }) as ProjectionPatch),
-        ],
+          { op: "truncate", keepCount: 0 },
+          ...frame.blocks.map((block): ProjectionPatch => ({ op: "append", block: toBlock(block) })),
+        ] satisfies ProjectionPatch[],
       }
     : applyPatches(previous.blocks, frame)
 
   const next: Projection = { text, blocks, patches }
+
   if (live) streams.set(next, instance)
 
   return next
